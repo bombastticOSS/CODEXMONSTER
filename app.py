@@ -1165,7 +1165,6 @@ with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0)
 			"Dias protegidos / a gerir",
 			COLUNAS_DIAS,
 			format_func=lambda chave: ROTULOS_DIAS[chave].replace("\n", " "),
-			key="trava_dias",
 			default=travas_da_pessoa,
 			key=f"trava_dias_{identificador_trava}",
 		)
