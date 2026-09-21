@@ -5,9 +5,15 @@ import io
 import os
 import json
 import datetime
-import plotly.express as px
-import plotly.graph_objects as go
 from ortools.sat.python import cp_model
+
+# Importação opcional do Plotly para evitar falha caso a biblioteca não esteja no requirements.txt
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    PLOTLY_DISPONIVEL = True
+except ImportError:
+    PLOTLY_DISPONIVEL = False
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DA PÁGINA
@@ -97,7 +103,6 @@ DOMINGOS_INDICES = []
 for d in range(DIAS_NO_MES):
     data_dia = datetime.date(ANO, MES, d + 1)
     sigla = DIAS_SEMANA_SIGLAS[data_dia.weekday() if data_dia.weekday() < 6 else 0]
-    # weekday(): Mon=0 .. Sun=6
     wd = data_dia.weekday()
     if wd == 6:  # Domingo
         sigla = "Dom"
@@ -118,7 +123,7 @@ CODIGOS_EDITAVEIS = ["", "M6", "D12", "N12", "FP", "FE", "AT", "LM", "LIC"]
 VALORES_HORAS = {"M6": 6, "D12": 12, "N12": 12, "": 0, "FP": 0, "FE": 0, "AT": 0, "LM": 0, "LIC": 0}
 
 # -----------------------------------------------------------------------------
-# PERSISTÊNCIA DE ESTADO LOCAL (COMPATÍVEL COM WINDOWS/LINUX/COLAB)
+# PERSISTÊNCIA DE ESTADO LOCAL
 # -----------------------------------------------------------------------------
 ARQUIVO_ESTADO = os.path.join(os.getcwd(), "escala_estado_hc15.json")
 
@@ -158,7 +163,7 @@ def salvar_estado():
 inicializar_estado()
 
 # -----------------------------------------------------------------------------
-# AUDITORIA E MÉTRIAS EM TEMPO REAL
+# AUDITORIA E MÉTRICAS EM TEMPO REAL
 # -----------------------------------------------------------------------------
 def auditar_escala(df_escala):
     mensagens = []
@@ -639,17 +644,21 @@ with aba_dashboard:
         cobertura_dados.append({"Dia": d_idx + 1, "Categoria": "TÉC Noturno (Meta: 6)", "Quantidade": tec_noturno, "Tipo": tipo_dia})
 
     df_cob = pd.DataFrame(cobertura_dados)
-    fig_cob = px.bar(
-        df_cob,
-        x="Dia",
-        y="Quantidade",
-        color="Categoria",
-        barmode="group",
-        title="Quantitativo Diário de Pessoal Presente no 15º Andar",
-        labels={"Quantidade": "Profissionais Presentes", "Dia": "Dia do Mês"},
-        height=380
-    )
-    st.plotly_chart(fig_cob, use_container_width=True)
+    if PLOTLY_DISPONIVEL:
+        fig_cob = px.bar(
+            df_cob,
+            x="Dia",
+            y="Quantidade",
+            color="Categoria",
+            barmode="group",
+            title="Quantitativo Diário de Pessoal Presente no 15º Andar",
+            labels={"Quantidade": "Profissionais Presentes", "Dia": "Dia do Mês"},
+            height=380
+        )
+        st.plotly_chart(fig_cob, use_container_width=True)
+    else:
+        pivot_cob = df_cob.pivot(index="Dia", columns="Categoria", values="Quantidade")
+        st.bar_chart(pivot_cob, use_container_width=True)
 
     st.divider()
 
@@ -664,16 +673,19 @@ with aba_dashboard:
             "Saldo_Horas": [metricas_atuais["Cumpridas"][i] - PROFISSIONAIS.iloc[i]['Meta_Horas'] for i in range(len(PROFISSIONAIS))]
         })
         
-        fig_saldo = px.bar(
-            df_saldos,
-            x="Nome",
-            y="Saldo_Horas",
-            color="Cargo",
-            title="Distribuição do Saldo de Horas Mensal (ACT EBSERH)",
-            labels={"Saldo_Horas": "Saldo em Horas (h)"},
-            height=350
-        )
-        st.plotly_chart(fig_saldo, use_container_width=True)
+        if PLOTLY_DISPONIVEL:
+            fig_saldo = px.bar(
+                df_saldos,
+                x="Nome",
+                y="Saldo_Horas",
+                color="Cargo",
+                title="Distribuição do Saldo de Horas Mensal (ACT EBSERH)",
+                labels={"Saldo_Horas": "Saldo em Horas (h)"},
+                height=350
+            )
+            st.plotly_chart(fig_saldo, use_container_width=True)
+        else:
+            st.bar_chart(df_saldos.set_index("Nome")["Saldo_Horas"], use_container_width=True)
 
     with col_g2:
         st.markdown("##### 📄 Relatório Nominal de Afastamentos")
