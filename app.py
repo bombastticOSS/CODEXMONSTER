@@ -718,9 +718,9 @@ def executar_otimizacao() -> tuple[bool, str]:
 	st.session_state.escala = nova.reset_index()
 	st.session_state.ultima_otimizacao = "Concluída agora"
 	st.session_state.revisao_grade = st.session_state.get("revisao_grade", 0) + 1
-salvar_estado()
+	salvar_estado()
 	qualidade = "ótima" if status == cp_model.OPTIMAL else "viável"
-return True, (
+	return True, (
 	f"Nova alternativa {qualidade} gerada. Todas as "
 	f"{sum(map(len, st.session_state.travas.values()))} travas foram preservadas."
 )
