@@ -1173,27 +1173,27 @@ with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0)
 			botao_travar = st.button("🔒 Travar", use_container_width=True, key="botao_travar")
 			botao_destravar = st.button("🔓 Destravar", use_container_width=True, key="botao_destravar")
 			b_travar, b_destravar, b_todos = st.columns(3)
-			botao_travar = b_travar.button("🔒 Travar", width="stretch", key="botao_travar")
-			botao_destravar = b_destravar.button("🔓 Seleção", width="stretch", key="botao_destravar")
+			botao_travar = b_travar.button("🔒 Travar", use_container_width=True, key="botao_travar")
+			botao_destravar = b_destravar.button("🔓 Seleção", use_container_width=True, key="botao_destravar")
 			botao_destravar_todos = b_todos.button(
 				"Liberar tudo", width="stretch", key="botao_destravar_todos", disabled=not travas_da_pessoa
 			)
-		if botao_travar and dias_trava:
-			aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "travar")
-			aplicar_travas(identificador_trava, dias_trava, "travar")
-			st.success("Travas aplicadas.")
-			st.rerun()
+			if botao_travar and dias_trava:
+				aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "travar")
+				aplicar_travas(identificador_trava, dias_trava, "travar")
+				st.success("Travas aplicadas.")
+				st.rerun()
 			
-		if botao_destravar and dias_trava:
-			aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "destravar")
-			aplicar_travas(identificador_trava, dias_trava, "destravar")
-			st.success("Travas removidas.")
-			st.rerun()
+			if botao_destravar and dias_trava:
+				aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "destravar")
+				aplicar_travas(identificador_trava, dias_trava, "destravar")
+				st.success("Travas removidas.")
+				st.rerun()
 			
-		if botao_destravar_todos:
-			aplicar_travas(identificador_trava, travas_da_pessoa, "destravar")
-			st.success("Todas as travas deste colaborador foram removidas.")
-			st.rerun()
+			if botao_destravar_todos:
+				aplicar_travas(identificador_trava, travas_da_pessoa, "destravar")
+				st.success("Todas as travas deste colaborador foram removidas.")
+				st.rerun()
 	with aba_lote:
 		l1, l2, l3 = st.columns([3, 3, 2])
 		selecionados = l1.multiselect("Colaboradores", list(opcoes_pessoas), key="lote_pessoas")
