@@ -820,8 +820,7 @@ with st.expander("Ferramentas de gestão da escala", expanded=False):
             qtd, _ = carregar_pedidos_arquivo(arq)
             st.success(f"{qtd} pedidos importados.")
             st.rerun()
-    with aba_exportar:
-        aba_escala, aba_dashboard = st.tabs(["📋 Escala mensal", "📊 Dashboard de dimensionamento"])
+    aba_escala, aba_dashboard = st.tabs(["📋 Escala mensal", "📊 Dashboard de dimensionamento"])
 with aba_escala:
     exibir_grade_mensal()
     # CORREÇÃO: Usando a variável 'avisos_auditoria' que foi gerada no topo do código
