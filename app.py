@@ -1172,6 +1172,9 @@ with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0)
 			st.write("")
 			botao_travar = st.button("🔒 Travar", use_container_width=True, key="botao_travar")
 			botao_destravar = st.button("🔓 Destravar", use_container_width=True, key="botao_destravar")
+
+		# Criando o botão antes do 'if':
+			botao_destravar_todos = st.button("🔓 Destravar Todos", use_container_width=True, key="botao_destravar_todos")
 			
 			if botao_travar and dias_trava:
 				aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "travar")
@@ -1184,8 +1187,9 @@ with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0)
 				st.rerun()
 			
 			if botao_destravar_todos:
-				aplicar_travas(identificador_trava, travas_da_pessoa, "destravar")
-				st.success("Todas as travas deste colaborador foram removidas.")
+				st.session_state.travas = {}
+				salvar_estado()
+				st.success("Todas as travas do sistema foram removidas.") 
 				st.rerun()
 	with aba_lote:
 		l1, l2, l3 = st.columns([3, 3, 2])
