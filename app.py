@@ -1,6 +1,13 @@
 """
-Sistema de Escalas Assistenciais — HC 15º Andar (Clínica Médica)
-Especificação Técnica Detalhada - Versão 7
+Protótipo de escala assistencial — HC 15º Andar
+
+Execução:
+    pip install -r requirements_escala_hc15.txt
+    streamlit run sistema_escala_hc15_refinado.py
+
+O arquivo persiste somente dados operacionais agregados no computador em que
+está sendo executado. Não armazena prontuários, diagnósticos ou identificadores
+de pacientes.
 """
 
 from __future__ import annotations
@@ -10,7 +17,9 @@ import io
 import json
 import os
 import random
-from datetime import date
+import re
+import unicodedata
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,29 +27,31 @@ import pandas as pd
 import streamlit as st
 from ortools.sat.python import cp_model
 
-# -----------------------------------------------------------------------------
-# 1. CONFIGURAÇÃO DE INTERFACE E ESTADO (Especificação Técnica Item 2 e 9)
-# -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Escala Assistencial | HC 15º Andar",
     page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 try:
-    from st_aggrid import AgGrid, DataReturnMode, GridUpdateMode, GridOptionsBuilder, JsCode
+    from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, JsCode
+
     AGGRID_DISPONIVEL = True
 except ImportError:
     AGGRID_DISPONIVEL = False
+
+    # Mantém o modo de contingência carregável quando a dependência opcional
+    # ainda não foi instalada. Os objetos não são usados nesse modo.
     def JsCode(*_args: Any, **_kwargs: Any) -> None:  # type: ignore[misc]
         return None
 
+
 # -----------------------------------------------------------------------------
-# 2. COMPETÊNCIA E REGRAS OPERACIONAIS (Especificação Técnica Item 11 e 17)
+# CONFIGURAÇÃO DA COMPETÊNCIA E DAS REGRAS OPERACIONAIS
 # -----------------------------------------------------------------------------
-ANO = 2026
-MES = 11
+ANO_PADRAO = 2026
+MES_PADRAO = 11
 LEITOS_TOTAIS = 60
 CODIGOS_EDITAVEIS = ["", "M6", "D12", "N12", "FP", "FE", "AT", "LM", "LIC"]
 CODIGOS_VALIDOS = set(CODIGOS_EDITAVEIS)
@@ -48,8 +59,52 @@ CODIGOS_AFASTAMENTO = {"FE", "AT", "LM", "LIC"}
 TURNOS = ("M6", "D12", "N12")
 HORAS_POR_CODIGO = {"M6": 6, "D12": 12, "N12": 12}
 NOMES_DIAS = ("Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom")
+NOMES_MESES = (
+    "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+    "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
+)
 
-# Cobertura mínima rígida (Hard Constraints)
+
+def deslocar_competencia(ano: int, mes: int, deslocamento: int) -> tuple[int, int]:
+    """Retorna uma competência mensal válida, inclusive na virada de ano."""
+    indice = ano * 12 + (mes - 1) + deslocamento
+    return indice // 12, indice % 12 + 1
+
+
+def selecionar_competencia() -> tuple[int, int]:
+    """Mantém a competência visível e troca somente o estado daquele período."""
+    st.session_state.setdefault("competencia_ano", ANO_PADRAO)
+    st.session_state.setdefault("competencia_mes", MES_PADRAO)
+    with st.sidebar:
+        st.markdown("### Período da escala")
+        atual_ano = int(st.session_state.competencia_ano)
+        atual_mes = int(st.session_state.competencia_mes)
+        anterior, proximo = st.columns(2)
+        if anterior.button("← Mês anterior", width="stretch", key="periodo_anterior"):
+            novo_ano, novo_mes = deslocar_competencia(atual_ano, atual_mes, -1)
+            st.session_state.competencia_ano = novo_ano
+            st.session_state.competencia_mes = novo_mes
+            st.rerun()
+        if proximo.button("Próximo mês →", width="stretch", key="periodo_proximo"):
+            novo_ano, novo_mes = deslocar_competencia(atual_ano, atual_mes, 1)
+            st.session_state.competencia_ano = novo_ano
+            st.session_state.competencia_mes = novo_mes
+            st.rerun()
+        ano = int(st.number_input("Ano", min_value=2020, max_value=2100, step=1, key="competencia_ano"))
+        mes = int(
+            st.selectbox(
+                "Mês", options=range(1, 13), format_func=lambda numero: NOMES_MESES[numero - 1], key="competencia_mes"
+            )
+        )
+        st.caption("Cada competência mantém sua própria escala, travas, pedidos e censo.")
+    return ano, mes
+
+
+ANO, MES = selecionar_competencia()
+CHAVE_COMPETENCIA = f"{ANO}-{MES:02d}"
+
+# Este é o único bloco a ajustar caso o dimensionamento mínimo do setor mude.
+# As chaves são cargo curto -> turno -> número mínimo de profissionais.
 REQUISITOS_COBERTURA = {
     "dia_util": {
         "ENF": {"M6": 1, "D12": 5, "N12": 4},
@@ -70,16 +125,34 @@ ROTULOS_DIAS = {
     f"D{data.day:02d}": f"{data.day:02d}\n{NOMES_DIAS[data.weekday()]}" for data in DATAS
 }
 
-def caminho_dados() -> Path:
-    raiz_padrao = Path(os.getenv("LOCALAPPDATA", Path.home())) / "HC15_Escala"
-    raiz = Path(os.getenv("ESCALA_DATA_DIR", str(raiz_padrao)))
-    raiz.mkdir(parents=True, exist_ok=True)
-    return raiz
 
-ARQUIVO_ESTADO = caminho_dados() / f"escala_{ANO}_{MES:02d}_v7.json"
+def caminho_dados() -> Path:
+    """Resolve um diretório persistente sem impedir a abertura do sistema."""
+    configurado = os.getenv("ESCALA_DATA_DIR")
+    candidatos = [Path(configurado)] if configurado else [
+        Path(os.getenv("LOCALAPPDATA", Path.home())) / "HC15_Escala",
+        Path.cwd() / "HC15_Escala",
+    ]
+    erros: list[str] = []
+    for raiz in candidatos:
+        try:
+            raiz.mkdir(parents=True, exist_ok=True)
+            return raiz
+        except OSError as erro:
+            erros.append(f"{raiz}: {erro}")
+    mensagem = "Não foi possível preparar o diretório de dados local. " + " | ".join(erros)
+    st.error(mensagem)
+    raise RuntimeError(mensagem)
+
+
+# O nome v6 é preservado para abrir diretamente os estados já gravados pela
+# versão anterior. A estrutura do JSON permanece compatível e recebe somente
+# campos novos que podem ser ignorados por versões antigas.
+ARQUIVO_ESTADO = caminho_dados() / f"escala_{ANO}_{MES:02d}_v6.json"
+
 
 # -----------------------------------------------------------------------------
-# 3. BASE DE DADOS IMUTÁVEL (Especificação Técnica Item 1)
+# BASE DEMONSTRATIVA — substitua esta fonte por integração segura no projeto real
 # -----------------------------------------------------------------------------
 @st.cache_data
 def carregar_profissionais() -> pd.DataFrame:
@@ -135,15 +208,22 @@ TEC-20,Tatiana Valente,Feminino,Técnico de Enfermagem,Noturno,40h,Sim"""
     profissionais["Meta"] = profissionais["Carga_Horaria_Semanal"].map({"36h": 156, "40h": 176})
     return profissionais
 
+
 PROFISSIONAIS = carregar_profissionais()
 POR_ID = PROFISSIONAIS.set_index("ID").to_dict("index")
 
+
 # -----------------------------------------------------------------------------
-# 4. PERSISTÊNCIA LOCAL (Especificação Técnica Item 1)
+# ESTADO E PERSISTÊNCIA
 # -----------------------------------------------------------------------------
 def valor_normalizado(valor: Any) -> str:
-    if pd.isna(valor): return ""
-    return str(valor).strip().upper()
+    if pd.isna(valor):
+        return ""
+    normalizado = str(valor).strip().upper()
+    # Aceita a notação curta que aparece com frequência em planilhas e mantém
+    # o armazenamento interno uniforme para cálculos e exportações.
+    return {"D": "D12", "N": "N12"}.get(normalizado, normalizado)
+
 
 def escala_vazia() -> pd.DataFrame:
     escala = PROFISSIONAIS[["ID"]].copy()
@@ -151,24 +231,33 @@ def escala_vazia() -> pd.DataFrame:
         escala[coluna] = ""
     return escala
 
+
 def censo_vazio() -> pd.DataFrame:
-    return pd.DataFrame({
-        "Dia": [f"{data.day:02d} {NOMES_DIAS[data.weekday()]}" for data in DATAS],
-        "Ala A": [0] * NUM_DIAS,
-        "Ala B": [0] * NUM_DIAS,
-    })
+    return pd.DataFrame(
+        {
+            "Dia": [f"{data.day:02d} {NOMES_DIAS[data.weekday()]}" for data in DATAS],
+            "Ala A": [0] * NUM_DIAS,
+            "Ala B": [0] * NUM_DIAS,
+        }
+    )
+
 
 def normalizar_escala_registros(registros: list[dict[str, Any]]) -> pd.DataFrame:
     recebida = pd.DataFrame(registros)
     base = escala_vazia().set_index("ID")
-    if "ID" not in recebida.columns: return base.reset_index()
-    recebida = recebida.set_index("ID")
+    if "ID" not in recebida.columns:
+        return base.reset_index()
+    # Um JSON editado manualmente não deve causar retorno de Series ao acessar
+    # uma célula. Mantém o último lançamento de cada profissional.
+    recebida = recebida.drop_duplicates(subset=["ID"], keep="last").set_index("ID")
     for identificador in base.index:
-        if identificador not in recebida.index: continue
+        if identificador not in recebida.index:
+            continue
         for coluna in COLUNAS_DIAS:
             if coluna in recebida.columns:
                 base.at[identificador, coluna] = valor_normalizado(recebida.at[identificador, coluna])
     return base.reset_index()
+
 
 def normalizar_censo_registros(registros: list[dict[str, Any]]) -> pd.DataFrame:
     base = censo_vazio()
@@ -176,11 +265,15 @@ def normalizar_censo_registros(registros: list[dict[str, Any]]) -> pd.DataFrame:
     for coluna in ("Ala A", "Ala B"):
         if coluna in recebida.columns:
             valores = pd.to_numeric(recebida[coluna], errors="coerce").fillna(0).clip(lower=0, upper=LEITOS_TOTAIS)
-            base.loc[: min(len(base), len(valores)) - 1, coluna] = valores.iloc[: len(base)].astype(int).tolist()
+            quantidade = min(len(base), len(valores))
+            if quantidade:
+                base.loc[: quantidade - 1, coluna] = valores.iloc[:quantidade].astype(int).tolist()
     return base
 
+
 def carregar_estado() -> dict[str, Any]:
-    if not ARQUIVO_ESTADO.exists(): return {}
+    if not ARQUIVO_ESTADO.exists():
+        return {}
     try:
         with ARQUIVO_ESTADO.open("r", encoding="utf-8") as arquivo:
             estado = json.load(arquivo)
@@ -189,22 +282,30 @@ def carregar_estado() -> dict[str, Any]:
         return {}
     return estado if isinstance(estado, dict) else {}
 
+
 def preparar_estado() -> None:
-    if "escala" in st.session_state: return
+    # O Streamlit mantém session_state durante o rerun. Sem esta chave, ao
+    # trocar o mês a tela continuava exibindo a escala da competência anterior.
+    if st.session_state.get("competencia_carregada") == CHAVE_COMPETENCIA:
+        return
     estado = carregar_estado()
     st.session_state.escala = normalizar_escala_registros(estado.get("escala", []))
     st.session_state.censo = normalizar_censo_registros(estado.get("censo", []))
     st.session_state.travas = {
-        str(identificador): set(dias)
+        str(identificador): {str(dia) for dia in dias if str(dia) in COLUNAS_DIAS}
         for identificador, dias in estado.get("travas", {}).items()
         if str(identificador) in POR_ID and isinstance(dias, list)
     }
     st.session_state.pedidos_folga = {
-        str(identificador): set(dias)
+        str(identificador): {str(dia) for dia in dias if str(dia) in COLUNAS_DIAS}
         for identificador, dias in estado.get("pedidos_folga", {}).items()
         if str(identificador) in POR_ID and isinstance(dias, list)
     }
     st.session_state.ultima_otimizacao = estado.get("ultima_otimizacao", "Ainda não executada")
+    st.session_state.ultima_mensagem_otimizacao = estado.get("ultima_mensagem_otimizacao", "")
+    st.session_state.competencia_carregada = CHAVE_COMPETENCIA
+    st.session_state.revisao_grade = st.session_state.get("revisao_grade", 0) + 1
+
 
 def salvar_estado() -> None:
     estado = {
@@ -213,67 +314,111 @@ def salvar_estado() -> None:
         "escala": st.session_state.escala.to_dict(orient="records"),
         "censo": st.session_state.censo.to_dict(orient="records"),
         "travas": {identificador: sorted(dias) for identificador, dias in st.session_state.travas.items() if dias},
-        "pedidos_folga": {identificador: sorted(dias) for identificador, dias in st.session_state.pedidos_folga.items() if dias},
+        "pedidos_folga": {
+            identificador: sorted(dias)
+            for identificador, dias in st.session_state.pedidos_folga.items()
+            if dias
+        },
         "ultima_otimizacao": st.session_state.ultima_otimizacao,
+        "ultima_mensagem_otimizacao": st.session_state.get("ultima_mensagem_otimizacao", ""),
     }
     try:
-        with ARQUIVO_ESTADO.open("w", encoding="utf-8") as arquivo:
+        arquivo_temporario = ARQUIVO_ESTADO.with_suffix(".tmp")
+        with arquivo_temporario.open("w", encoding="utf-8") as arquivo:
             json.dump(estado, arquivo, ensure_ascii=False, indent=2)
+        arquivo_temporario.replace(ARQUIVO_ESTADO)
     except OSError as erro:
         st.error(f"Não foi possível salvar o estado local em {ARQUIVO_ESTADO}: {erro}")
 
+
 preparar_estado()
 
+
 # -----------------------------------------------------------------------------
-# 5. CÁLCULOS DE COBERTURA E AUDITORIA
+# CÁLCULOS DE COBERTURA, AUDITORIA E DIMENSIONAMENTO
 # -----------------------------------------------------------------------------
-def eh_fim_de_semana(indice_dia: int) -> bool: return DATAS[indice_dia].weekday() >= 5
+def eh_fim_de_semana(indice_dia: int) -> bool:
+    return DATAS[indice_dia].weekday() >= 5
+
+
 def requisito_do_dia(indice_dia: int) -> dict[str, dict[str, int]]:
     tipo = "fim_de_semana" if eh_fim_de_semana(indice_dia) else "dia_util"
     return REQUISITOS_COBERTURA[tipo]
 
-def horas_de(valor: str) -> int: return HORAS_POR_CODIGO.get(valor_normalizado(valor), 0)
+
+def horas_de(valor: str) -> int:
+    return HORAS_POR_CODIGO.get(valor_normalizado(valor), 0)
+
 
 def turno_permitido(profissional: dict[str, Any], valor: str) -> bool:
-    if valor not in TURNOS: return True
-    if profissional["Turno_Atribuido"] == "Noturno": return valor == "N12"
+    if valor not in TURNOS:
+        return True
+    if profissional["Turno_Atribuido"] == "Noturno":
+        return valor == "N12"
     return valor in {"M6", "D12"}
 
+
 def valor_exibido(identificador: str, coluna: str, valor_real: str) -> str:
-    if not valor_real and coluna in st.session_state.pedidos_folga.get(identificador, set()): return "FP"
+    """FP é preferência, não uma folga obrigatória: só aparece quando não há plantão."""
+    if not valor_real and coluna in st.session_state.pedidos_folga.get(identificador, set()):
+        return "FP"
     return valor_real
+
 
 def calcular_metricas_diarias(escala: pd.DataFrame) -> pd.DataFrame:
     linhas: list[dict[str, Any]] = []
     por_id = escala.set_index("ID")
+
     for indice, data in enumerate(DATAS):
         coluna = COLUNAS_DIAS[indice]
         exigido = requisito_do_dia(indice)
         contagem = {cargo: {turno: 0 for turno in TURNOS} for cargo in ("ENF", "TÉC")}
-        horas, pessoas = 0, 0
+        horas = 0
+        pessoas = 0
+
         for identificador, profissional in POR_ID.items():
             valor = valor_normalizado(por_id.at[identificador, coluna])
             if valor in TURNOS:
                 contagem[profissional["Cargo curto"]][valor] += 1
                 pessoas += 1
                 horas += horas_de(valor)
+
         previstos = sum(exigido[cargo][turno] for cargo in exigido for turno in TURNOS)
         realizados = sum(contagem[cargo][turno] for cargo in contagem for turno in TURNOS)
-        deficit = sum(max(0, exigido[cargo][turno] - contagem[cargo][turno]) for cargo in exigido for turno in TURNOS)
-        excedente = sum(max(0, contagem[cargo][turno] - exigido[cargo][turno]) for cargo in exigido for turno in TURNOS)
-        linhas.append({
-            "Chave": coluna, "Dia": f"{data.day:02d} {NOMES_DIAS[data.weekday()]}",
-            "Tipo de dia": "Fim de semana" if eh_fim_de_semana(indice) else "Dia útil",
-            "ENF M6": contagem["ENF"]["M6"], "ENF D12": contagem["ENF"]["D12"], "ENF N12": contagem["ENF"]["N12"],
-            "TÉC M6": contagem["TÉC"]["M6"], "TÉC D12": contagem["TÉC"]["D12"], "TÉC N12": contagem["TÉC"]["N12"],
-            "Pessoas escaladas": pessoas, "Plantões previstos": previstos,
-            "Déficit": deficit, "Excedente": excedente,
-            "Cobertura %": round(min(100, realizados / previstos * 100), 1) if previstos else 100.0,
-            "Horas programadas": horas,
-        })
+        deficit = sum(
+            max(0, exigido[cargo][turno] - contagem[cargo][turno])
+            for cargo in exigido
+            for turno in TURNOS
+        )
+        excedente = sum(
+            max(0, contagem[cargo][turno] - exigido[cargo][turno])
+            for cargo in exigido
+            for turno in TURNOS
+        )
+        linhas.append(
+            {
+                "Chave": coluna,
+                "Dia": f"{data.day:02d} {NOMES_DIAS[data.weekday()]}",
+                "Tipo de dia": "Fim de semana" if eh_fim_de_semana(indice) else "Dia útil",
+                "ENF M6": contagem["ENF"]["M6"],
+                "ENF D12": contagem["ENF"]["D12"],
+                "ENF N12": contagem["ENF"]["N12"],
+                "TÉC M6": contagem["TÉC"]["M6"],
+                "TÉC D12": contagem["TÉC"]["D12"],
+                "TÉC N12": contagem["TÉC"]["N12"],
+                "Pessoas escaladas": pessoas,
+                "Plantões previstos": previstos,
+                "Déficit": deficit,
+                "Excedente": excedente,
+                "Cobertura %": round(min(100, realizados / previstos * 100), 1) if previstos else 100.0,
+                "Horas programadas": horas,
+            }
+        )
     return pd.DataFrame(linhas)
 
+
 def auditar_escala(escala: pd.DataFrame) -> tuple[dict[str, set[str]], list[str], pd.DataFrame]:
+    """Marca células problemáticas; não afirma conformidade legal integral."""
     problemas: dict[str, set[str]] = {identificador: set() for identificador in POR_ID}
     mensagens: list[str] = []
     por_id = escala.set_index("ID")
@@ -281,19 +426,22 @@ def auditar_escala(escala: pd.DataFrame) -> tuple[dict[str, set[str]], list[str]
     for identificador, profissional in POR_ID.items():
         valores = [valor_normalizado(por_id.at[identificador, coluna]) for coluna in COLUNAS_DIAS]
         nome = profissional["Nome"]
+
         for indice, valor in enumerate(valores):
             if valor not in CODIGOS_VALIDOS:
                 problemas[identificador].add(COLUNAS_DIAS[indice])
                 mensagens.append(f"{nome}: código inválido “{valor}” no dia {indice + 1}.")
             elif not turno_permitido(profissional, valor):
                 problemas[identificador].add(COLUNAS_DIAS[indice])
-                mensagens.append(f"{nome}: {valor} incompatível com turno cadastrado no dia {indice + 1}.")
+                mensagens.append(f"{nome}: {valor} é incompatível com o turno cadastrado no dia {indice + 1}.")
 
         for indice in range(NUM_DIAS - 1):
             atual, proximo = valores[indice], valores[indice + 1]
             if atual in {"D12", "N12"} and proximo in TURNOS:
                 problemas[identificador].update({COLUNAS_DIAS[indice], COLUNAS_DIAS[indice + 1]})
-                mensagens.append(f"{nome}: intervalo insuficiente entre dias {indice + 1} e {indice + 2}.")
+                mensagens.append(
+                    f"{nome}: intervalo insuficiente entre os dias {indice + 1} ({atual}) e {indice + 2} ({proximo})."
+                )
 
         consecutivos = 0
         for indice, valor in enumerate(valores):
@@ -312,8 +460,9 @@ def auditar_escala(escala: pd.DataFrame) -> tuple[dict[str, set[str]], list[str]
     metricas = calcular_metricas_diarias(escala)
     for _, linha in metricas.iterrows():
         if int(linha["Déficit"]) > 0:
-            mensagens.append(f"Dia {linha['Dia']}: déficit de {int(linha['Déficit'])} posições.")
+            mensagens.append(f"Dia {linha['Dia']}: déficit de {int(linha['Déficit'])} posição(ões) na cobertura mínima.")
     return problemas, mensagens, metricas
+
 
 def totais_por_profissional(escala: pd.DataFrame) -> pd.DataFrame:
     por_id = escala.set_index("ID")
@@ -325,16 +474,51 @@ def totais_por_profissional(escala: pd.DataFrame) -> pd.DataFrame:
         linhas.append({"ID": identificador, "Meta": meta, "Realizado": realizado, "Saldo": realizado - meta})
     return pd.DataFrame(linhas).set_index("ID")
 
+
+def calcular_indisponibilidades_diarias(escala: pd.DataFrame) -> pd.DataFrame:
+    """Resume afastamentos sem confundi-los com folga preferencial ou turno."""
+    por_id = escala.set_index("ID")
+    linhas: list[dict[str, Any]] = []
+    for indice, coluna in enumerate(COLUNAS_DIAS):
+        contagens = {codigo: 0 for codigo in CODIGOS_AFASTAMENTO}
+        for identificador in POR_ID:
+            valor = valor_normalizado(por_id.at[identificador, coluna])
+            if valor in contagens:
+                contagens[valor] += 1
+        total = sum(contagens.values())
+        linhas.append(
+            {
+                "Chave": coluna,
+                "Dia": f"{DATAS[indice].day:02d} {NOMES_DIAS[DATAS[indice].weekday()]}",
+                "Disponíveis": len(POR_ID) - total,
+                "Indisponíveis": total,
+                "Férias": contagens["FE"],
+                "Atestados": contagens["AT"],
+                "Licença maternidade": contagens["LM"],
+                "Licença pessoal": contagens["LIC"],
+            }
+        )
+    return pd.DataFrame(linhas)
+
+
 def linha_cobertura(metricas: pd.DataFrame) -> dict[str, Any]:
     linha: dict[str, Any] = {
-        "_tipo": "cobertura", "_id": "__COBERTURA__", "Código/Cargo": "STATUS", "Nome": "Cobertura mínima",
-        "Meta": "", "Realizado": "", "Saldo": "", "_travas": "[]", "_problemas": "[]",
+        "_tipo": "cobertura",
+        "_id": "__COBERTURA__",
+        "Código/Cargo": "STATUS",
+        "Nome": "Cobertura mínima",
+        "Meta": "",
+        "Realizado": "",
+        "Saldo": "",
+        "_travas": "[]",
+        "_problemas": "[]",
     }
     for _, metrica in metricas.iterrows():
         coluna = metrica["Chave"]
         deficit, excedente = int(metrica["Déficit"]), int(metrica["Excedente"])
         linha[coluna] = "OK" if deficit == 0 and excedente == 0 else (f"–{deficit}" if deficit else f"+{excedente}")
     return linha
+
 
 def montar_grade_exibicao(escala: pd.DataFrame) -> pd.DataFrame:
     problemas, _, metricas = auditar_escala(escala)
@@ -345,24 +529,49 @@ def montar_grade_exibicao(escala: pd.DataFrame) -> pd.DataFrame:
     for cargo, titulo in (("ENF", None), ("TÉC", "TÉCNICOS DE ENFERMAGEM")):
         if titulo:
             divisor = {
-                "_tipo": "divisor", "_id": "__TECNICOS__", "Código/Cargo": "EQUIPE", "Nome": titulo,
-                "Meta": "", "Realizado": "", "Saldo": "", "_travas": "[]", "_problemas": "[]",
+                "_tipo": "divisor",
+                "_id": "__TECNICOS__",
+                "Código/Cargo": "EQUIPE",
+                "Nome": titulo,
+                "Meta": "",
+                "Realizado": "",
+                "Saldo": "",
+                "_travas": "[]",
+                "_problemas": "[]",
             }
             divisor.update({coluna: "" for coluna in COLUNAS_DIAS})
             linhas.append(divisor)
+
+            # Repetir as datas elimina a necessidade de subir até o topo para
+            # conferir o dia ao lançar a escala dos técnicos.
             cabecalho_tecnicos = {
-                "_tipo": "cabecalho_tecnicos", "_id": "__DATAS_TECNICOS__", "Código/Cargo": "DATAS", "Nome": "Técnicos de enfermagem",
-                "Meta": "", "Realizado": "", "Saldo": "", "_travas": "[]", "_problemas": "[]",
+                "_tipo": "cabecalho_tecnicos",
+                "_id": "__DATAS_TECNICOS__",
+                "Código/Cargo": "DATAS",
+                "Nome": "Técnicos de enfermagem",
+                "Meta": "",
+                "Realizado": "",
+                "Saldo": "",
+                "_travas": "[]",
+                "_problemas": "[]",
             }
-            cabecalho_tecnicos.update({coluna: ROTULOS_DIAS[coluna].replace("\n", " ") for coluna in COLUNAS_DIAS})
+            cabecalho_tecnicos.update(
+                {coluna: ROTULOS_DIAS[coluna].replace("\n", " ") for coluna in COLUNAS_DIAS}
+            )
             linhas.append(cabecalho_tecnicos)
 
         for _, profissional in PROFISSIONAIS[PROFISSIONAIS["Cargo curto"] == cargo].iterrows():
             identificador = profissional["ID"]
             linha = {
-                "_tipo": "profissional", "_id": identificador, "Código/Cargo": profissional["Código/Cargo"], "Nome": profissional["Nome"],
-                "Meta": f"{int(totais.at[identificador, 'Meta'])}h", "Realizado": f"{int(totais.at[identificador, 'Realizado'])}h",
+                "_tipo": "profissional",
+                "_id": identificador,
+                "Código/Cargo": profissional["Código/Cargo"],
+                "Nome": profissional["Nome"],
+                "Meta": f"{int(totais.at[identificador, 'Meta'])}h",
+                "Realizado": f"{int(totais.at[identificador, 'Realizado'])}h",
                 "Saldo": f"{int(totais.at[identificador, 'Saldo']):+d}h",
+                # A grade recebe strings JSON, não listas Python: assim o
+                # JavaScript não tenta chamar .includes em um objeto serializado.
                 "_travas": json.dumps(sorted(st.session_state.travas.get(identificador, set()))),
                 "_problemas": json.dumps(sorted(problemas.get(identificador, set()))),
             }
@@ -371,24 +580,31 @@ def montar_grade_exibicao(escala: pd.DataFrame) -> pd.DataFrame:
             linhas.append(linha)
     return pd.DataFrame(linhas)
 
+
 # -----------------------------------------------------------------------------
-# 6. ATUALIZAÇÃO MANUAL E LANÇAMENTOS EM LOTE
+# ATUALIZAÇÃO MANUAL, TRAVAS E PEDIDOS DE FOLGA
 # -----------------------------------------------------------------------------
 def aplicar_edicoes_da_grade(retorno: pd.DataFrame) -> bool:
-    if retorno is None or retorno.empty or "_id" not in retorno.columns: return False
+    """Registra edição manual e trava a célula; FP permanece uma preferência flexível."""
+    if retorno is None or retorno.empty or "_id" not in retorno.columns:
+        return False
     anterior = montar_grade_exibicao(st.session_state.escala).set_index("_id")
     escala = st.session_state.escala.set_index("ID")
     alterou = False
+
     for _, linha in retorno.iterrows():
         identificador = str(linha.get("_id", ""))
-        if identificador not in POR_ID or identificador not in anterior.index: continue
+        if identificador not in POR_ID or identificador not in anterior.index:
+            continue
         for coluna in COLUNAS_DIAS:
             novo = valor_normalizado(linha.get(coluna, ""))
             antigo_exibido = valor_normalizado(anterior.at[identificador, coluna])
-            if novo == antigo_exibido: continue
+            if novo == antigo_exibido:
+                continue
             alterou = True
             pedidos = st.session_state.pedidos_folga.setdefault(identificador, set())
             travas = st.session_state.travas.setdefault(identificador, set())
+
             if novo == "FP":
                 escala.at[identificador, coluna] = ""
                 pedidos.add(coluna)
@@ -396,11 +612,14 @@ def aplicar_edicoes_da_grade(retorno: pd.DataFrame) -> bool:
             else:
                 escala.at[identificador, coluna] = novo
                 pedidos.discard(coluna)
+                # Inclui branco: o gestor pode proteger explicitamente uma folga.
                 travas.add(coluna)
+
     if alterou:
         st.session_state.escala = escala.reset_index()
         salvar_estado()
     return alterou
+
 
 def aplicar_marcacao_em_lote(identificadores: list[str], dias: list[str], codigo: str) -> int:
     escala = st.session_state.escala.set_index("ID")
@@ -409,7 +628,8 @@ def aplicar_marcacao_em_lote(identificadores: list[str], dias: list[str], codigo
         travas = st.session_state.travas.setdefault(identificador, set())
         pedidos = st.session_state.pedidos_folga.setdefault(identificador, set())
         for coluna in dias:
-            if coluna in travas: continue
+            if coluna in travas:
+                continue
             if codigo == "FP":
                 escala.at[identificador, coluna] = ""
                 pedidos.add(coluna)
@@ -422,34 +642,110 @@ def aplicar_marcacao_em_lote(identificadores: list[str], dias: list[str], codigo
     salvar_estado()
     return modificadas
 
+
 def aplicar_travas(identificador: str, dias: list[str], acao: str) -> None:
     travas = st.session_state.travas.setdefault(identificador, set())
-    if acao == "travar": travas.update(dias)
-    else: travas.difference_update(dias)
+    if acao == "travar":
+        travas.update(dias)
+    else:
+        travas.difference_update(dias)
+    # Força a atualização das regras de edição da grade após destravar.
     st.session_state.revisao_grade = st.session_state.get("revisao_grade", 0) + 1
     salvar_estado()
 
+
+def texto_normalizado(texto: Any) -> str:
+    """Normaliza cabeçalhos de planilhas sem alterar os dados do usuário."""
+    base = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", base.strip().lower())
+
+
+def localizar_coluna(colunas: list[Any], alternativas: tuple[str, ...]) -> Any | None:
+    mapa = {texto_normalizado(coluna): coluna for coluna in colunas}
+    for alternativa in alternativas:
+        if alternativa in mapa:
+            return mapa[alternativa]
+    return None
+
+
+def extrair_dias_pedido(valor: Any) -> set[str]:
+    """Converte números, D05 e datas de uma resposta Forms em chaves DXX."""
+    if pd.isna(valor):
+        return set()
+    if isinstance(valor, (pd.Timestamp, datetime, date)):
+        data_pedido = pd.Timestamp(valor)
+        return {f"D{data_pedido.day:02d}"} if data_pedido.year == ANO and data_pedido.month == MES else set()
+
+    texto = str(valor)
+    encontrados: set[str] = set()
+    # Datas completas são aceitas somente se pertencerem à competência aberta.
+    for trecho in re.findall(r"\b(?:\d{1,2}[/-]){2}\d{2,4}\b", texto):
+        data_pedido = pd.to_datetime(trecho, dayfirst=True, errors="coerce")
+        if not pd.isna(data_pedido) and data_pedido.year == ANO and data_pedido.month == MES:
+            encontrados.add(f"D{data_pedido.day:02d}")
+        texto = texto.replace(trecho, " ")
+    # Depois de retirar datas completas, aceita "Dia 5", "D05", "5, 12" etc.
+    for numero in re.findall(r"(?<!\d)(?:dia\s*|d\s*)?(0?[1-9]|[12]\d|3[01])(?!\d)", texto, flags=re.IGNORECASE):
+        dia = int(numero)
+        if dia <= NUM_DIAS:
+            encontrados.add(f"D{dia:02d}")
+    return encontrados
+
+
+def dias_do_intervalo(inicio: str, fim: str) -> list[str]:
+    inicio_indice, fim_indice = COLUNAS_DIAS.index(inicio), COLUNAS_DIAS.index(fim)
+    if inicio_indice > fim_indice:
+        inicio_indice, fim_indice = fim_indice, inicio_indice
+    return COLUNAS_DIAS[inicio_indice : fim_indice + 1]
+
+
 def carregar_pedidos_arquivo(arquivo: Any) -> tuple[int, list[str]]:
-    pedidos = pd.read_excel(arquivo) if arquivo.name.lower().endswith(".xlsx") else pd.read_csv(arquivo)
+    """Lê exportações CSV/XLSX de Forms e conserva folgas como preferência."""
+    if arquivo.name.lower().endswith(".xlsx"):
+        pedidos = pd.read_excel(arquivo)
+    else:
+        pedidos = pd.read_csv(arquivo, sep=None, engine="python")
     avisos: list[str] = []
     incluidos = 0
+    coluna_id = localizar_coluna(list(pedidos.columns), ("id", "matricula", "identificador"))
+    coluna_nome = localizar_coluna(list(pedidos.columns), ("nome", "nome completo", "colaborador", "profissional"))
+    coluna_dias = localizar_coluna(
+        list(pedidos.columns),
+        ("dias_folga", "dias folga", "dias", "pedido de folga", "folgas", "datas de folga"),
+    )
+    if coluna_dias is None or (coluna_id is None and coluna_nome is None):
+        return 0, [
+            "Não foram encontradas as colunas de identificação e dias. Use ID ou Nome e Dias_Folga, Dias ou Pedido de folga."
+        ]
+
     for _, linha in pedidos.iterrows():
-        referencia = str(linha.get("ID", linha.get("Nome", linha.get("Nome Completo", "")))).strip().lower()
-        dias_brutos = str(linha.get("Dias_Folga", linha.get("Dias", "")))
-        identificador = next((ident for ident, prof in POR_ID.items() if referencia == ident.lower() or referencia == str(prof["Nome"]).lower()), None)
+        referencia_id = str(linha[coluna_id]).strip().lower() if coluna_id is not None and not pd.isna(linha[coluna_id]) else ""
+        referencia_nome = str(linha[coluna_nome]).strip().lower() if coluna_nome is not None and not pd.isna(linha[coluna_nome]) else ""
+        identificador = next(
+            (
+                ident
+                for ident, prof in POR_ID.items()
+                if referencia_id == ident.lower() or referencia_nome == str(prof["Nome"]).lower()
+            ),
+            None,
+        )
         if not identificador:
-            avisos.append(f"Colaborador não localizado: {referencia or 'sem identificação'}.")
+            avisos.append(f"Colaborador não localizado: {referencia_id or referencia_nome or 'sem identificação'}.")
             continue
-        for parte in dias_brutos.split(","):
-            texto = parte.strip().lower().replace("dia", "").replace("d", "").strip()
-            if not texto.isdigit() or not 1 <= int(texto) <= NUM_DIAS: continue
-            st.session_state.pedidos_folga.setdefault(identificador, set()).add(f"D{int(texto):02d}")
-            incluidos += 1
+        dias = extrair_dias_pedido(linha[coluna_dias])
+        if not dias:
+            avisos.append(f"Nenhum dia válido para {POR_ID[identificador]['Nome']} na competência selecionada.")
+            continue
+        pedidos_profissional = st.session_state.pedidos_folga.setdefault(identificador, set())
+        novos = dias - pedidos_profissional
+        pedidos_profissional.update(dias)
+        incluidos += len(novos)
     salvar_estado()
     return incluidos, avisos
 
+
 # -----------------------------------------------------------------------------
-# 7. OTIMIZADOR CP-SAT: RESOLUÇÃO DA SINTAXE (Especificação Técnica Item 16)
+# OTIMIZADOR CP-SAT: respeita toda célula travada, inclusive folga vazia
 # -----------------------------------------------------------------------------
 def executar_otimizacao() -> tuple[bool, str]:
     escala_atual = st.session_state.escala.set_index("ID")
@@ -457,16 +753,24 @@ def executar_otimizacao() -> tuple[bool, str]:
     profissionais = list(POR_ID)
     variaveis = {
         (identificador, indice, turno): modelo.NewBoolVar(f"{identificador}_{indice}_{turno}")
-        for identificador in profissionais for indice in range(NUM_DIAS) for turno in TURNOS
+        for identificador in profissionais
+        for indice in range(NUM_DIAS)
+        for turno in TURNOS
     }
 
+    # Domínio de cada pessoa/dia e aplicação das travas do gestor.
     for identificador in profissionais:
         profissional = POR_ID[identificador]
         for indice, coluna in enumerate(COLUNAS_DIAS):
             modelo.AddAtMostOne(variaveis[identificador, indice, turno] for turno in TURNOS)
             valor = valor_normalizado(escala_atual.at[identificador, coluna])
             travada = coluna in st.session_state.travas.get(identificador, set())
-            if travada:
+            # Afastamentos são indisponibilidades do dia, mesmo se vierem de
+            # uma importação antiga que não tenha registrado a trava.
+            if valor in CODIGOS_AFASTAMENTO:
+                for turno in TURNOS:
+                    modelo.Add(variaveis[identificador, indice, turno] == 0)
+            elif travada:
                 if valor in TURNOS:
                     for turno in TURNOS:
                         modelo.Add(variaveis[identificador, indice, turno] == int(turno == valor))
@@ -479,6 +783,7 @@ def executar_otimizacao() -> tuple[bool, str]:
             else:
                 modelo.Add(variaveis[identificador, indice, "N12"] == 0)
 
+    # Descanso entre jornadas, máximo de seis dias seguidos e domingos.
     for identificador in profissionais:
         profissional = POR_ID[identificador]
         for indice in range(NUM_DIAS - 1):
@@ -486,42 +791,73 @@ def executar_otimizacao() -> tuple[bool, str]:
             proximo_dia = sum(variaveis[identificador, indice + 1, turno] for turno in TURNOS)
             modelo.Add(doze_horas + proximo_dia <= 1)
         for inicio in range(NUM_DIAS - 6):
-            modelo.Add(sum(variaveis[identificador, inicio + d, turno] for d in range(7) for turno in TURNOS) <= 6)
+            modelo.Add(
+                sum(variaveis[identificador, inicio + deslocamento, turno] for deslocamento in range(7) for turno in TURNOS)
+                <= 6
+            )
         if profissional["Sexo"] == "Feminino":
             domingos = [indice for indice, data in enumerate(DATAS) if data.weekday() == 6]
             for anterior, seguinte in zip(domingos, domingos[1:]):
-                modelo.Add(sum(variaveis[identificador, anterior, t] for t in TURNOS) + sum(variaveis[identificador, seguinte, t] for t in TURNOS) <= 1)
+                modelo.Add(
+                    sum(variaveis[identificador, anterior, turno] for turno in TURNOS)
+                    + sum(variaveis[identificador, seguinte, turno] for turno in TURNOS)
+                    <= 1
+                )
 
+    # Cobertura mínima por categoria e turno. O uso de >= preserva uma
+    # cobertura manual já travada acima do mínimo; o excesso é penalizado na
+    # função objetivo para que o solver não escale pessoas sem necessidade.
+    excessos_cobertura = []
     for indice in range(NUM_DIAS):
         requisito = requisito_do_dia(indice)
         for cargo in ("ENF", "TÉC"):
             ids_cargo = [ident for ident in profissionais if POR_ID[ident]["Cargo curto"] == cargo]
             for turno in TURNOS:
-                modelo.Add(sum(variaveis[ident, indice, turno] for ident in ids_cargo) == requisito[cargo][turno])
+                total_turno = sum(variaveis[ident, indice, turno] for ident in ids_cargo)
+                minimo = requisito[cargo][turno]
+                modelo.Add(total_turno >= minimo)
+                excesso = modelo.NewIntVar(0, len(ids_cargo) - minimo, f"excesso_{cargo}_{indice}_{turno}")
+                modelo.Add(excesso == total_turno - minimo)
+                excessos_cobertura.append(excesso)
 
+    # A cada execução, desempates recebem um peso novo. As travas permanecem
+    # absolutas; somente as células livres podem gerar uma alternativa distinta.
     semente = random.SystemRandom().randint(1, 2_147_483_647)
     sorteio = random.Random(semente)
-    penalidades, desvios_absolutos = [], []
-    
+    penalidades = []
+    desvios_absolutos = []
+    maximo_horas_mes = NUM_DIAS * max(HORAS_POR_CODIGO.values())
     for identificador in profissionais:
         meta = int(POR_ID[identificador]["Meta"])
-        horas = sum(variaveis[identificador, indice, "M6"] * 6 + variaveis[identificador, indice, "D12"] * 12 + variaveis[identificador, indice, "N12"] * 12 for indice in range(NUM_DIAS))
-        diferenca = modelo.NewIntVar(-96, 96, f"diferenca_{identificador}")
-        absoluto = modelo.NewIntVar(0, 96, f"absoluto_{identificador}")
+        horas = sum(
+            variaveis[identificador, indice, "M6"] * 6
+            + variaveis[identificador, indice, "D12"] * 12
+            + variaveis[identificador, indice, "N12"] * 12
+            for indice in range(NUM_DIAS)
+        )
+        meta = int(POR_ID[identificador]["Meta"])
+        limite_desvio = max(meta, maximo_horas_mes - meta)
+        diferenca = modelo.NewIntVar(-meta, maximo_horas_mes - meta, f"diferenca_{identificador}")
+        absoluto = modelo.NewIntVar(0, limite_desvio, f"absoluto_{identificador}")
         modelo.Add(diferenca == horas - meta)
         modelo.AddAbsEquality(absoluto, diferenca)
         desvios_absolutos.append(absoluto)
+        # Primeiro equilibra o maior desvio individual; depois a soma dos saldos.
+        # Isso evita concentrar dívidas grandes em poucas pessoas.
         penalidades.append(absoluto * 1_000)
         for coluna in st.session_state.pedidos_folga.get(identificador, set()):
             if coluna in COLUNAS_DIAS:
                 indice = COLUNAS_DIAS.index(coluna)
                 penalidades.append(sum(variaveis[identificador, indice, turno] for turno in TURNOS) * 100_000)
 
-    maior_desvio = modelo.NewIntVar(0, 96, "maior_desvio")
+    maior_desvio = modelo.NewIntVar(0, maximo_horas_mes, "maior_desvio_individual")
     for desvio in desvios_absolutos:
         modelo.Add(maior_desvio >= desvio)
     penalidades.append(maior_desvio * 100_000)
+    penalidades.extend(excesso * 20_000 for excesso in excessos_cobertura)
 
+    # Desempate de baixa prioridade: reorganiza os grupos sem sacrificar
+    # cobertura, pedidos de folga ou equilíbrio de horas.
     for variavel in variaveis.values():
         penalidades.append(variavel * sorteio.randint(0, 9))
 
@@ -529,15 +865,25 @@ def executar_otimizacao() -> tuple[bool, str]:
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30.0
     solver.parameters.num_search_workers = 8
+    solver.parameters.random_seed = semente
+    solver.parameters.randomize_search = True
     status = solver.Solve(modelo)
 
     if status not in {cp_model.OPTIMAL, cp_model.FEASIBLE}:
-        return False, "Otimização inviável ou tempo esgotado. Revise as travas e cobertura mínima."
+        descricao = "inviável" if status == cp_model.INFEASIBLE else "sem solução no tempo disponível"
+        return False, (
+            f"Otimização {descricao}. Revise as travas, afastamentos e a cobertura mínima; "
+            "nenhuma escala existente foi alterada."
+        )
 
     nova = escala_atual.copy()
     for identificador in profissionais:
         for indice, coluna in enumerate(COLUNAS_DIAS):
-            if coluna in st.session_state.travas.get(identificador, set()): continue
+            valor_atual = valor_normalizado(nova.at[identificador, coluna])
+            # Um afastamento importado ou recuperado de estado antigo continua
+            # visível e indisponível naquele dia, ainda que não tenha trava.
+            if coluna in st.session_state.travas.get(identificador, set()) or valor_atual in CODIGOS_AFASTAMENTO:
+                continue
             novo_valor = ""
             for turno in TURNOS:
                 if solver.Value(variaveis[identificador, indice, turno]):
@@ -545,25 +891,29 @@ def executar_otimizacao() -> tuple[bool, str]:
                     break
             nova.at[identificador, coluna] = novo_valor
 
-    # SINTAXE CORRIGIDA NESTE BLOCO
     st.session_state.escala = nova.reset_index()
     st.session_state.ultima_otimizacao = "Concluída agora"
     st.session_state.revisao_grade = st.session_state.get("revisao_grade", 0) + 1
-    salvar_estado()
-    
     qualidade = "ótima" if status == cp_model.OPTIMAL else "viável"
-    total_travas = sum(map(len, st.session_state.travas.values()))
-    
-    return True, f"Escala {qualidade} gerada. Todas as {total_travas} travas foram preservadas."
+    mensagem = (
+        f"Nova alternativa {qualidade} gerada. Todas as "
+        f"{sum(map(len, st.session_state.travas.values()))} travas foram preservadas."
+    )
+    st.session_state.ultima_mensagem_otimizacao = mensagem
+    salvar_estado()
+    return True, mensagem
+
 
 # -----------------------------------------------------------------------------
-# 8. CONFIGURAÇÃO DA GRADE AGGRID (Especificação Técnica Itens 7 e 8)
+# GRADE MENSAL: editável, com seleção, destaque e bloqueio por célula
 # -----------------------------------------------------------------------------
 ESTILO_CELULA = JsCode(
     """
 function(params) {
   const field = params.colDef.field;
-  const fimDeSemana = """ + json.dumps(COLUNAS_FIM_DE_SEMANA) + """;
+  const fimDeSemana = """
+    + json.dumps(COLUNAS_FIM_DE_SEMANA)
+    + """;
   const listaSegura = (raw) => {
     if (Array.isArray(raw)) return raw;
     if (typeof raw === 'string') { try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; } catch (_) { return []; } }
@@ -575,7 +925,7 @@ function(params) {
   const issue = listaSegura(params.data._problemas).includes(field);
   let style = {textAlign: 'center', fontWeight: '600', paddingLeft: '2px', paddingRight: '2px'};
   if (type === 'divisor') return {backgroundColor: '#0f172a', color: '#f8fafc', fontWeight: '800'};
-  if (type === 'cabecalho_tecnicos') return {backgroundColor: '#dbe4ee', color: '#0f172a', fontWeight: '800'};
+  if (type === 'cabecalho_tecnicos') return {backgroundColor: '#dbe4ee', color: '#0f172a', fontWeight: '800', textAlign: 'center'};
   if (type === 'cobertura') {
     if (value === 'OK') return {...style, backgroundColor: '#d1fae5', color: '#065f46'};
     if (value.startsWith('–')) return {...style, backgroundColor: '#fee2e2', color: '#991b1b', border: '2px solid #ef4444'};
@@ -586,6 +936,7 @@ function(params) {
     'FP': ['#dcfce7', '#166534'], 'FE': ['#fef3c7', '#92400e'], 'AT': ['#fee2e2', '#991b1b'],
     'LM': ['#f3e8ff', '#6b21a8'], 'LIC': ['#ffedd5', '#9a3412']
   };
+  // Fim de semana usa cinza-azulado e borda grafite; M6 continua azul.
   if (fimDeSemana.includes(field)) style.borderTop = '3px solid #64748b';
   if (colors[value]) { style.backgroundColor = colors[value][0]; style.color = colors[value][1]; }
   if (!value && field.startsWith('D')) style.backgroundColor = fimDeSemana.includes(field) ? '#f1f5f9' : '#ffffff';
@@ -612,16 +963,22 @@ function(params) {
   let travas = [];
   try { travas = Array.isArray(params.data._travas) ? params.data._travas : JSON.parse(params.data._travas || '[]'); } catch (_) { travas = []; }
   const valor = params.value == null ? '' : String(params.value);
+  // O componente Streamlit-AgGrid é renderizado por React e aceita texto,
+  // não um HTMLElement criado manualmente.
   return travas.includes(params.colDef.field) ? valor + ' 🔒' : valor;
 }
 """
 )
 
+
 def exibir_grade_mensal() -> None:
     grade = montar_grade_exibicao(st.session_state.escala)
     instrucao, legenda = st.columns([3.7, 2.3], vertical_alignment="center")
     with instrucao:
-        st.caption("Edite células livres pelo menu. A alteração manual recebe 🔒 automaticamente.")
+        st.caption(
+            "Edite células livres pelo menu. A alteração manual recebe 🔒 automaticamente; "
+            "FP é preferência e não bloqueia a otimização. Use o painel de travas para liberar uma célula."
+        )
     with legenda:
         st.markdown(
             "<div class='legenda'>"
@@ -633,45 +990,82 @@ def exibir_grade_mensal() -> None:
         )
 
     if not AGGRID_DISPONIVEL:
-        st.warning("Para a grade executiva AgGrid, instale as dependências (streamlit-aggrid).")
+        st.warning("Modo de contingência ativo: instale streamlit-aggrid para obter colunas fixas, cores e travas visuais.")
+        opcoes_coluna = {
+            coluna: st.column_config.SelectboxColumn(ROTULOS_DIAS[coluna], options=CODIGOS_EDITAVEIS, width="small")
+            for coluna in COLUNAS_DIAS
+        }
+        simples = grade[grade["_tipo"] == "profissional"].copy()
+        retorno = st.data_editor(
+            simples,
+            hide_index=True,
+            width="stretch",
+            disabled=["_tipo", "_id", "Código/Cargo", "Nome", "Meta", "Realizado", "Saldo", "_travas", "_problemas"],
+            column_config=opcoes_coluna,
+            key=f"grade_basica_{CHAVE_COMPETENCIA}_{st.session_state.revisao_grade}",
+        )
+        aplicar_edicoes_da_grade(retorno)
         return
 
-    construtor = GridOptionsBuilder.from_dataframe(grade)
+    # A linha de status é fixada pelo AgGrid; o restante conserva o divisor de
+    # categorias e o cabeçalho repetido para os técnicos.
+    linha_status = grade[grade["_tipo"] == "cobertura"].to_dict(orient="records")
+    grade_operacional = grade[grade["_tipo"] != "cobertura"].copy()
+    construtor = GridOptionsBuilder.from_dataframe(grade_operacional)
     construtor.configure_default_column(sortable=False, filter=False, resizable=False, suppressMovable=True)
     construtor.configure_column("_tipo", hide=True)
     construtor.configure_column("_id", hide=True)
     construtor.configure_column("_travas", hide=True)
     construtor.configure_column("_problemas", hide=True)
-    
-    # ATUALIZAÇÃO ARQUITETURAL: PINNED LEFT (Item 7 da Especificação)
-    construtor.configure_column("Código/Cargo", width=104, minWidth=94, maxWidth=120, pinned="left", editable=False, cellStyle=ESTILO_CELULA)
-    construtor.configure_column("Nome", width=165, minWidth=140, pinned="left", editable=False, cellStyle=ESTILO_CELULA)
-    
-    # COLUNAS CENTRAIS
+    construtor.configure_column(
+        "Código/Cargo", width=108, minWidth=108, maxWidth=128, pinned="left", editable=False, cellStyle=ESTILO_CELULA
+    )
+    construtor.configure_column(
+        "Nome", width=174, minWidth=150, maxWidth=230, pinned="left", editable=False, cellStyle=ESTILO_CELULA
+    )
     for coluna in COLUNAS_DIAS:
         construtor.configure_column(
-            coluna, header_name=ROTULOS_DIAS[coluna], width=31, minWidth=27, maxWidth=42,
-            editable=EDITAVEL_SE_NAO_TRAVADO, cellEditor="agSelectCellEditor",
-            cellEditorParams={"values": CODIGOS_EDITAVEIS}, cellStyle=ESTILO_CELULA,
-            cellRenderer=RENDERIZAR_COM_CADEADO, wrapHeaderText=True,
+            coluna,
+            header_name=ROTULOS_DIAS[coluna],
+            headerTooltip=ROTULOS_DIAS[coluna].replace("\n", " "),
+            width=44,
+            minWidth=38,
+            maxWidth=54,
+            editable=EDITAVEL_SE_NAO_TRAVADO,
+            cellEditor="agSelectCellEditor",
+            cellEditorParams={"values": CODIGOS_EDITAVEIS},
+            cellStyle=ESTILO_CELULA,
+            cellRenderer=RENDERIZAR_COM_CADEADO,
+            wrapHeaderText=True,
         )
-    
-    # ATUALIZAÇÃO ARQUITETURAL: PINNED RIGHT (Item 7 da Especificação)
     for coluna in ("Meta", "Realizado", "Saldo"):
-        construtor.configure_column(coluna, width=70, minWidth=62, pinned="right", editable=False, cellStyle=ESTILO_CELULA)
-        
+        construtor.configure_column(
+            coluna, width=76, minWidth=70, maxWidth=92, pinned="right", editable=False, cellStyle=ESTILO_CELULA
+        )
     construtor.configure_grid_options(
-        headerHeight=48, rowHeight=34,
-        suppressHorizontalScroll=True, alwaysShowHorizontalScroll=False,
-        stopEditingWhenCellsLoseFocus=True, suppressCellFocus=False,
+        headerHeight=48,
+        rowHeight=34,
+        pinnedTopRowData=linha_status,
+        suppressHorizontalScroll=False,
+        alwaysShowHorizontalScroll=True,
+        stopEditingWhenCellsLoseFocus=True,
+        suppressCellFocus=False,
     )
-    
-    altura = min(max(610, len(grade) * 34 + 65), 940)
+    opcoes = construtor.build()
+    # Não comprime turnos nem datas para forçar uma largura impossível. Em
+    # monitores panorâmicos a competência cabe inteira; em telas menores, a
+    # rolagem nativa preserva a leitura e mantém nomes/saldos fixos.
+    altura = min(max(610, len(grade_operacional) * 34 + 104), 940)
     resposta = AgGrid(
-        grade, gridOptions=construtor.build(), height=altura, theme="streamlit",
-        update_mode=GridUpdateMode.VALUE_CHANGED, data_return_mode=DataReturnMode.AS_INPUT,
-        fit_columns_on_grid_load=True, reload_data=True, allow_unsafe_jscode=True,
-        key="grade_mensal_hc15",
+        grade_operacional,
+        gridOptions=opcoes,
+        height=altura,
+        theme="streamlit",
+        update_on=["cellValueChanged"],
+        data_return_mode=DataReturnMode.AS_INPUT,
+        fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=True,
+        key=f"grade_mensal_hc15_{CHAVE_COMPETENCIA}_{st.session_state.revisao_grade}",
     )
     retorno = resposta.get("data") if isinstance(resposta, dict) else None
     if retorno is not None:
@@ -679,8 +1073,9 @@ def exibir_grade_mensal() -> None:
         if aplicar_edicoes_da_grade(retorno_df):
             st.rerun()
 
+
 # -----------------------------------------------------------------------------
-# 9. DASHBOARDS E GESTÃO EXECUTIVA (Especificação Técnica Itens 25 e 28)
+# DASHBOARD E CENSO MANUAL DAS ALAS
 # -----------------------------------------------------------------------------
 def atualizar_censo(censo_editado: pd.DataFrame) -> tuple[bool, list[str]]:
     proximo = censo_vazio()
@@ -688,52 +1083,80 @@ def atualizar_censo(censo_editado: pd.DataFrame) -> tuple[bool, list[str]]:
         proximo[coluna] = pd.to_numeric(censo_editado[coluna], errors="coerce").fillna(0).round().astype(int).clip(lower=0)
     invalidos = proximo[proximo["Ala A"] + proximo["Ala B"] > LEITOS_TOTAIS]
     if not invalidos.empty:
-        return False, [f"O total das alas ultrapassa {LEITOS_TOTAIS} leitos em: {', '.join(invalidos['Dia'].tolist())}"]
+        dias = ", ".join(invalidos["Dia"].tolist())
+        return False, [f"O total das alas A e B ultrapassa {LEITOS_TOTAIS} leitos em: {dias}."]
     if not proximo.equals(st.session_state.censo):
         st.session_state.censo = proximo
         salvar_estado()
     return True, []
 
+
 def dashboard() -> None:
     _, mensagens, metricas = auditar_escala(st.session_state.escala)
+    indisponibilidades = calcular_indisponibilidades_diarias(st.session_state.escala)
     censo = st.session_state.censo.copy()
     censo["Total"] = censo["Ala A"] + censo["Ala B"]
     censo["Ocupação %"] = (censo["Total"] / LEITOS_TOTAIS * 100).round(1)
     resumo = metricas.copy()
+    resumo["Pacientes Ala A"] = censo["Ala A"].values
+    resumo["Pacientes Ala B"] = censo["Ala B"].values
     resumo["Pacientes"] = censo["Total"].values
     resumo["Ocupação %"] = censo["Ocupação %"].values
+    resumo = resumo.merge(indisponibilidades.drop(columns=["Dia"]), on="Chave", how="left")
     resumo["Pacientes por profissional"] = resumo.apply(
-        lambda linha: round(linha["Pacientes"] / linha["Pessoas escaladas"], 2) if linha["Pessoas escaladas"] else None, axis=1)
+        lambda linha: round(linha["Pacientes"] / linha["Pessoas escaladas"], 2) if linha["Pessoas escaladas"] else None,
+        axis=1,
+    )
 
     st.subheader("Censo manual e capacidade das alas")
+    st.caption("Registre o censo de cada dia. Ala A + Ala B não pode ultrapassar 60 leitos; o censo não altera a escala automaticamente.")
+    censo_para_editar = censo[["Dia", "Ala A", "Ala B", "Total", "Ocupação %"]]
     censo_coluna, capacidade_coluna = st.columns([1.45, 1], vertical_alignment="top")
     with censo_coluna:
-        censo_para_editar = censo[["Dia", "Ala A", "Ala B", "Total", "Ocupação %"]]
         censo_editado = st.data_editor(
-            censo_para_editar, hide_index=True, width="stretch", num_rows="fixed", disabled=["Dia", "Total", "Ocupação %"],
+            censo_para_editar,
+            hide_index=True,
+            width="stretch",
+            num_rows="fixed",
+            disabled=["Dia", "Total", "Ocupação %"],
             column_config={
                 "Ala A": st.column_config.NumberColumn("Ala A", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
                 "Ala B": st.column_config.NumberColumn("Ala B", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
                 "Ocupação %": st.column_config.NumberColumn("Ocupação %", format="%.1f%%"),
-            }, key="censo_alas",
+            },
+            key="censo_alas",
         )
     with capacidade_coluna:
         st.markdown("##### Capacidade do 15º andar")
         k_a, k_b = st.columns(2)
         k_a.metric("Leitos", LEITOS_TOTAIS)
         k_b.metric("Maior ocupação", f"{float(censo['Ocupação %'].max()):.1f}%")
-        
+        st.info("O censo é uma informação de dimensionamento: ele contextualiza a escala, mas não cria plantões automaticamente.")
     valido, avisos = atualizar_censo(censo_editado)
     if not valido:
-        for aviso in avisos: st.error(aviso)
+        for aviso in avisos:
+            st.error(aviso)
         return
-    if not censo_editado.equals(censo_para_editar): st.rerun()
+    if not censo_editado.equals(censo_para_editar):
+        st.rerun()
+
+    total_metas = int(totais_por_profissional(st.session_state.escala)["Meta"].sum())
+    total_horas = int(resumo["Horas programadas"].sum())
+    media_cobertura = float(resumo["Cobertura %"].mean())
+    dias_criticos = int((resumo["Déficit"] > 0).sum())
+    maior_ocupacao = float(resumo["Ocupação %"].max())
+    media_pacientes = float(resumo["Pacientes"].mean())
+    media_disponiveis = float(resumo["Disponíveis"].mean())
 
     st.subheader("Leitura executiva da competência")
     k1, k2, k3 = st.columns(3)
-    k1.metric("Cobertura média", f"{float(resumo['Cobertura %'].mean()):.1f}%")
-    k2.metric("Dias críticos", f"{int((resumo['Déficit'] > 0).sum())}")
-    k3.metric("Horas programadas", f"{int(resumo['Horas programadas'].sum())}h")
+    k1.metric("Cobertura média", f"{media_cobertura:.1f}%")
+    k2.metric("Dias críticos", f"{dias_criticos}", "com déficit" if dias_criticos else "sem déficit")
+    k3.metric("Horas programadas", f"{total_horas}h", f"meta total: {total_metas}h")
+    k4, k5, k6 = st.columns(3)
+    k4.metric("Ocupação máxima", f"{maior_ocupacao:.1f}%")
+    k5.metric("Média de pacientes/dia", f"{media_pacientes:.1f}")
+    k6.metric("Média disponível/dia", f"{media_disponiveis:.1f}", f"alertas: {len(mensagens)}")
 
     grafico = resumo.set_index("Dia")
     esquerda, direita = st.columns(2)
@@ -744,90 +1167,230 @@ def dashboard() -> None:
         st.markdown("##### Cobertura e ocupação")
         st.line_chart(grafico[["Cobertura %", "Ocupação %"]], width="stretch")
 
+    comparativo = (
+        resumo.groupby("Tipo de dia", as_index=False)
+        .agg(
+            **{
+                "Cobertura média %": ("Cobertura %", "mean"),
+                "Pessoas/dia": ("Pessoas escaladas", "mean"),
+                "Horas/dia": ("Horas programadas", "mean"),
+                "Pacientes/dia": ("Pacientes", "mean"),
+                "Pacientes/profissional": ("Pacientes por profissional", "mean"),
+                "Déficit acumulado": ("Déficit", "sum"),
+            }
+        )
+        .round(2)
+    )
+    comparacao_coluna, criterio_coluna = st.columns([1.6, 1], vertical_alignment="top")
+    with comparacao_coluna:
+        st.markdown("##### Comparativo: dias úteis × fins de semana")
+        st.dataframe(comparativo, width="stretch", hide_index=True)
+    with criterio_coluna:
+        st.markdown("##### Leitura rápida")
+        st.caption("Cobertura mede plantões realizados contra o mínimo configurado. Pacientes por profissional é um indicador de carga, não substitui parâmetro assistencial oficial.")
+
+    criticos = resumo[(resumo["Déficit"] > 0) | (resumo["Ocupação %"] >= 90)].copy()
+    if not criticos.empty:
+        atencao_coluna, espaco_coluna = st.columns([1.7, 1], vertical_alignment="top")
+        with atencao_coluna:
+            st.markdown("##### Dias que exigem atenção")
+            st.dataframe(
+                criticos[
+                    ["Dia", "Pacientes Ala A", "Pacientes Ala B", "Ocupação %", "Pessoas escaladas", "Déficit", "Cobertura %"]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        with espaco_coluna:
+            st.warning("Priorize dias com déficit. Acima de 90% de ocupação, reavalie a distribuição entre as alas.")
+    else:
+        st.success("Não há déficit de cobertura nem ocupação acima de 90% nos dados atuais.")
+
+    with st.expander("Ausências e disponibilidade por dia"):
+        st.caption("Afastamentos reduzem a disponibilidade somente nos dias registrados; pedidos de folga permanecem preferências.")
+        st.dataframe(
+            indisponibilidades.drop(columns=["Chave"]),
+            width="stretch",
+            hide_index=True,
+            height=360,
+        )
+
+    with st.expander("Ver base diária completa de dimensionamento"):
+        st.dataframe(
+            resumo.drop(columns=["Chave"]),
+            width="stretch",
+            hide_index=True,
+            height=520,
+        )
+
+
 def gerar_excel() -> bytes:
     _, _, metricas = auditar_escala(st.session_state.escala)
     grade = montar_grade_exibicao(st.session_state.escala)
+    indisponibilidades = calcular_indisponibilidades_diarias(st.session_state.escala)
     censo = st.session_state.censo.copy()
+    censo["Total"] = censo["Ala A"] + censo["Ala B"]
+    censo["Ocupação %"] = (censo["Total"] / LEITOS_TOTAIS * 100).round(1)
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         grade.drop(columns=["_tipo", "_id", "_travas", "_problemas"]).to_excel(writer, sheet_name="Escala mensal", index=False)
         metricas.drop(columns=["Chave"]).to_excel(writer, sheet_name="Cobertura diária", index=False)
         censo.to_excel(writer, sheet_name="Censo alas", index=False)
+        indisponibilidades.drop(columns=["Chave"]).to_excel(writer, sheet_name="Ausências", index=False)
     return buffer.getvalue()
 
+
 # -----------------------------------------------------------------------------
-# 10. INTERFACE PRINCIPAL (Especificação Técnica Item 3)
+# INTERFACE
 # -----------------------------------------------------------------------------
 st.markdown(
     """
 <style>
-  .block-container {max-width: 1600px; padding: 1.45rem 2.5rem 2.8rem; margin: 0 auto;}
+  .block-container {max-width: none; width: 98%; padding: 1rem 1.2rem 2rem; margin: 0 auto;}
   h1 {font-size: 1.7rem !important; margin-bottom: .1rem !important;}
   [data-testid="stMetric"] {background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: .65rem;}
+  [data-testid="stMetricLabel"] {font-size: .78rem !important; color: #334155 !important;}
+  [data-testid="stMetricValue"] {font-size: 1.35rem !important; color: #0f172a !important;}
+  [data-testid="stMetricDelta"] {color: #475569 !important;}
+  button[kind="primary"] {background-color: #0f766e !important; border-color: #0f766e !important; color: #ffffff !important;}
   .legenda {display:flex; flex-wrap:wrap; justify-content:flex-end; gap:.25rem; margin:.1rem 0 .35rem;}
   .legenda span {border-radius:999px; padding:.15rem .38rem; font-size:.64rem; font-weight:700;}
   .m6 {background:#dbeafe;color:#1e3a8a}.d12 {background:#cffafe;color:#155e75}.n12 {background:#e0e7ff;color:#3730a3}
   .fp {background:#dcfce7;color:#166534}.fe {background:#fef3c7;color:#92400e}.at {background:#fee2e2;color:#991b1b}
   .lm {background:#f3e8ff;color:#6b21a8}.lic {background:#ffedd5;color:#9a3412}.lock {background:#eef2ff;color:#3730a3}.error {background:#fecaca;color:#991b1b}
+  .stTabs [data-baseweb="tab-list"] {gap: .55rem;}
+  .stTabs [data-baseweb="tab"] {height: 42px; border-radius: 8px 8px 0 0; padding: 0 1.1rem;}
+  [data-testid="stDataFrame"] {font-size: 11px;}
+  @media (max-width: 900px) {.block-container {width: 100%; padding-left: .7rem; padding-right: .7rem;}}
 </style>
-""", unsafe_allow_html=True,
+""",
+    unsafe_allow_html=True,
 )
 
-st.title("🏥 Escalas de Enfermagem — Clínica Médica — 15º andar")
-st.caption(f"{COMPETENCIA.strftime('%B').capitalize()}/{ANO} · visão mensal editável · dimensionamento das alas A/B")
+st.title("🏥 ESCALAS DE ENFERMAGEM — Clínica Médica — 15º andar")
+st.caption(
+    f"HC-UFG / EBSERH · {NOMES_MESES[MES - 1]}/{ANO} · visão mensal editável · "
+    "60 leitos nas alas A e B"
+)
 
 _, avisos_auditoria, metricas_atuais = auditar_escala(st.session_state.escala)
 travas_ativas = sum(len(dias) for dias in st.session_state.travas.values())
-
-# Cabeçalho Executivo de 4 colunas
 c1, c2, c3, c4 = st.columns([1.15, 1.15, 1.2, 2.5])
 with c1:
-    if st.button("✨ Otimizar escala", type="primary", use_container_width=True):
+    if st.button("✨ Otimizar escala", type="primary", width="stretch"):
         with st.spinner("Calculando a melhor escala sem modificar células protegidas..."):
             sucesso, mensagem = executar_otimizacao()
         if sucesso:
-            st.success(mensagem)
             st.rerun()
         else:
             st.error(mensagem)
-with c2: st.metric("Células protegidas 🔒", travas_ativas)
-with c3: st.metric("Dias com déficit 🚨", int((metricas_atuais["Déficit"] > 0).sum()))
-with c4: st.caption("A otimização respeita todas as células com 🔒. Para alterar uma delas, destrave-a explicitamente no painel de gestão antes de editar.")
+with c2:
+    st.metric("Células protegidas", travas_ativas)
+with c3:
+    st.metric("Dias com déficit", int((metricas_atuais["Déficit"] > 0).sum()))
+with c4:
+    st.caption("Fluxo: importar folgas → lançar período → ajustar célula → otimizar → analisar dashboards.")
 
-# Ferramentas Retráteis (Item 4 da Especificação)
+if st.session_state.get("ultima_mensagem_otimizacao"):
+    st.success(st.session_state.ultima_mensagem_otimizacao)
+
 with st.expander("Ferramentas de gestão da escala", expanded=False):
-    aba_travas, aba_lote, aba_pedidos, aba_exportar = st.tabs(["🔒 Travas", "📌 Lançamento em lote", "🌿 Pedidos de folga", "⬇️ Exportar"])
+    aba_pedidos, aba_lote, aba_travas, aba_exportar = st.tabs(
+        ["1 · 🌿 Pedidos de folga", "2 · 📌 Lançamento em lote", "3 · ✏️ Alteração específica", "⬇️ Exportar"]
+    )
     with aba_travas:
         opcoes_pessoas = {f"{linha['Nome']} ({linha['Código/Cargo']})": linha["ID"] for _, linha in PROFISSIONAIS.iterrows()}
-        e, c, d = st.columns([2, 4, 4])
-        pessoa = e.selectbox("Colaborador", list(opcoes_pessoas), key="t_p")
-        identificador = opcoes_pessoas[pessoa]
-        dias_t = c.multiselect("Dias protegidos", COLUNAS_DIAS, format_func=lambda c: ROTULOS_DIAS[c].replace("\n", " "), default=sorted(st.session_state.travas.get(identificador, set())), key="t_d")
-        with d:
-            if st.button("🔒 Travar", use_container_width=True): aplicar_travas(identificador, dias_t, "travar"); st.rerun()
-            if st.button("🔓 Destravar Seleção", use_container_width=True): aplicar_travas(identificador, dias_t, "destravar"); st.rerun()
+        esquerda, centro, direita = st.columns([2, 4, 4])
+        pessoa_nome = esquerda.selectbox("Colaborador", list(opcoes_pessoas), key="trava_pessoa")
+        identificador_trava = opcoes_pessoas[pessoa_nome]
+        travas_da_pessoa = sorted(st.session_state.travas.get(identificador_trava, set()))
+        esquerda.caption(f"{len(travas_da_pessoa)} dia(s) protegido(s)")
+        dias_trava = centro.multiselect(
+            "Dias protegidos / a gerir",
+            COLUNAS_DIAS,
+            format_func=lambda chave: ROTULOS_DIAS[chave].replace("\n", " "),
+            default=travas_da_pessoa,
+            key=f"trava_dias_{identificador_trava}_{CHAVE_COMPETENCIA}",
+        )
+        with direita:
+            b_travar, b_destravar, b_todos = st.columns(3)
+            botao_travar = b_travar.button("🔒 Travar", width="stretch", key="botao_travar")
+            botao_destravar = b_destravar.button("🔓 Seleção", width="stretch", key="botao_destravar")
+            botao_destravar_todos = b_todos.button(
+                "Liberar tudo", width="stretch", key="botao_destravar_todos", disabled=not travas_da_pessoa
+            )
+        if botao_travar and dias_trava:
+            aplicar_travas(identificador_trava, dias_trava, "travar")
+            st.success("Travas aplicadas.")
+            st.rerun()
+        if botao_destravar and dias_trava:
+            aplicar_travas(identificador_trava, dias_trava, "destravar")
+            st.success("Travas removidas.")
+            st.rerun()
+        if botao_destravar_todos:
+            aplicar_travas(identificador_trava, travas_da_pessoa, "destravar")
+            st.success("Todas as travas deste colaborador foram removidas.")
+            st.rerun()
     with aba_lote:
-        l1, l2, l3 = st.columns([3, 3, 2])
-        sel = l1.multiselect("Colaboradores", list(opcoes_pessoas), key="l_p")
-        cod = l2.selectbox("Código", CODIGOS_EDITAVEIS, key="l_c")
-        dias_l = l3.multiselect("Dias", COLUNAS_DIAS, format_func=lambda c: ROTULOS_DIAS[c].replace("\n", " "), key="l_d")
-        if st.button("Aplicar nas células livres"):
-            aplicar_marcacao_em_lote([opcoes_pessoas[n] for n in sel], dias_l, cod)
-            st.rerun()
+        l1, l2, l3, l4 = st.columns([3.1, 2.1, 1.4, 1.4])
+        selecionados = l1.multiselect("Colaboradores", list(opcoes_pessoas), key=f"lote_pessoas_{CHAVE_COMPETENCIA}")
+        codigo_lote = l2.selectbox(
+            "Classificação", CODIGOS_EDITAVEIS, format_func=lambda v: v or "FOL · folga regulamentar", key=f"lote_codigo_{CHAVE_COMPETENCIA}"
+        )
+        inicio_lote = l3.selectbox(
+            "Início", COLUNAS_DIAS, format_func=lambda chave: ROTULOS_DIAS[chave].replace("\n", " "), key=f"lote_inicio_{CHAVE_COMPETENCIA}"
+        )
+        fim_lote = l4.selectbox(
+            "Fim", COLUNAS_DIAS, format_func=lambda chave: ROTULOS_DIAS[chave].replace("\n", " "), key=f"lote_fim_{CHAVE_COMPETENCIA}"
+        )
+        dias_lote = dias_do_intervalo(inicio_lote, fim_lote)
+        st.caption(f"Período selecionado: {ROTULOS_DIAS[dias_lote[0]].replace(chr(10), ' ')} a {ROTULOS_DIAS[dias_lote[-1]].replace(chr(10), ' ')} ({len(dias_lote)} dia(s)).")
+        if st.button("Aplicar apenas em células livres", key="aplicar_lote"):
+            ids = [opcoes_pessoas[nome] for nome in selecionados]
+            if not ids or not dias_lote:
+                st.warning("Selecione ao menos um colaborador e um dia.")
+            else:
+                numero = aplicar_marcacao_em_lote(ids, dias_lote, codigo_lote)
+                st.success(f"{numero} célula(s) atualizada(s). Células já protegidas foram preservadas.")
+                st.rerun()
     with aba_pedidos:
-        arq = st.file_uploader("Importar CSV/XLSX (Google Forms)", type=["csv", "xlsx"])
-        if arq and st.button("Ler pedidos"):
-            qtd, _ = carregar_pedidos_arquivo(arq)
-            st.success(f"{qtd} pedidos importados.")
-            st.rerun()
+        arquivo_pedidos = st.file_uploader("Importar pedidos CSV ou XLSX", type=["csv", "xlsx"], key=f"pedidos_upload_{CHAVE_COMPETENCIA}")
+        st.caption("Colunas aceitas: ID, Matrícula, Nome ou Colaborador; Dias_Folga, Dias, Pedido de folga ou Datas de folga. Exemplo: ENF-01 / 5, 12, 22.")
+        if arquivo_pedidos is not None and st.button("Ler pedidos", key=f"ler_pedidos_{CHAVE_COMPETENCIA}"):
+            try:
+                quantidade, avisos = carregar_pedidos_arquivo(arquivo_pedidos)
+                st.success(f"{quantidade} pedido(s) de folga carregado(s) como preferência.")
+                for aviso in avisos[:5]:
+                    st.warning(aviso)
+                st.rerun()
+            except Exception as erro:
+                st.error(f"Não foi possível ler o arquivo: {erro}")
     with aba_exportar:
-        st.download_button("Baixar Excel consolidado", data=gerar_excel(), file_name=f"escala_{ANO}_{MES:02d}.xlsx", mime="application/vnd.ms-excel", use_container_width=True)
+        st.download_button(
+            "Baixar Excel da escala e do dashboard",
+            data=gerar_excel(),
+            file_name=f"escala_hc15_{ANO}_{MES:02d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
 
 aba_escala, aba_dashboard = st.tabs(["📋 Escala mensal", "📊 Dashboard de dimensionamento"])
 with aba_escala:
     exibir_grade_mensal()
+    _, mensagens, _ = auditar_escala(st.session_state.escala)
     if mensagens:
-        with st.expander(f"⚠️ {len(mensagens)} alerta(s) de consistência", expanded=True):
-            for m in mensagens[:20]: st.write(f"• {m}")
+        with st.expander(f"⚠️ {len(mensagens)} alerta(s) de consistência e cobertura", expanded=True):
+            for mensagem in mensagens[:20]:
+                st.write(f"• {mensagem}")
+            if len(mensagens) > 20:
+                st.caption(f"Mostrando 20 de {len(mensagens)} alertas.")
+    else:
+        st.success("A escala atende às regras e à cobertura configuradas neste protótipo.")
 with aba_dashboard:
     dashboard()
+
+st.divider()
+st.caption(
+    "Protótipo operacional: antes de uso assistencial real, valide metas de carga horária, cobertura mínima, "
+    "regras sindicais/legais e governança de acesso com RH, enfermagem e TI."
+)
