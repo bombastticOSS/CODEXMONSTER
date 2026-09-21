@@ -1033,13 +1033,15 @@ def dashboard() -> None:
 	)
 	comparacao_coluna, criterio_coluna = st.columns([1.6, 1], vertical_alignment="top")
 	with comparacao_coluna:
-	st.markdown("##### Comparativo: dias úteis × fins de semana")
-	st.dataframe(comparativo, use_container_width=True, hide_index=True)
 		st.markdown("##### Comparativo: dias úteis × fins de semana")
-		st.dataframe(comparativo, width="stretch", hide_index=True)
+		st.dataframe(comparativo, use_container_width=True, hide_index=True)
+		
 	with criterio_coluna:
 		st.markdown("##### Leitura rápida")
-		st.caption("Cobertura mede plantões realizados contra o mínimo configurado. Pacientes por profissional é um indicador de carga, não substitui parâmetro assistencial oficial.")
+		st.caption(
+			"Cobertura mede plantões realizados contra o mínimo configurado. "
+			"Pacientes por profissional é um indicador de carga, não substitui parâmetro assistencial oficial."
+		)
 
 	criticos = resumo[(resumo["Déficit"] > 0) | (resumo["Ocupação %"] >= 90)].copy()
 	if not criticos.empty:
