@@ -409,8 +409,8 @@ def linha_cobertura(metricas: pd.DataFrame) -> dict[str, Any]:
         "Meta": "",
         "Realizado": "",
         "Saldo": "",
-        "_travas": [],
-        "_problemas": [],
+        "_travas": "[]",
+        "_problemas": "[]",
     }
     for _, metrica in metricas.iterrows():
         coluna = metrica["Chave"]
@@ -435,8 +435,8 @@ def montar_grade_exibicao(escala: pd.DataFrame) -> pd.DataFrame:
                 "Meta": "",
                 "Realizado": "",
                 "Saldo": "",
-                "_travas": [],
-                "_problemas": [],
+                "_travas": "[]",
+                "_problemas": "[]",
             }
             divisor.update({coluna: "" for coluna in COLUNAS_DIAS})
             linhas.append(divisor)
@@ -451,8 +451,10 @@ def montar_grade_exibicao(escala: pd.DataFrame) -> pd.DataFrame:
                 "Meta": f"{int(totais.at[identificador, 'Meta'])}h",
                 "Realizado": f"{int(totais.at[identificador, 'Realizado'])}h",
                 "Saldo": f"{int(totais.at[identificador, 'Saldo']):+d}h",
-                "_travas": sorted(st.session_state.travas.get(identificador, set())),
-                "_problemas": sorted(problemas.get(identificador, set())),
+                # A grade recebe strings JSON, não listas Python: assim o
+                # JavaScript não tenta chamar .includes em um objeto serializado.
+                "_travas": json.dumps(sorted(st.session_state.travas.get(identificador, set()))),
+                "_problemas": json.dumps(sorted(problemas.get(identificador, set()))),
             }
             for coluna in COLUNAS_DIAS:
                 linha[coluna] = valor_exibido(identificador, coluna, valor_normalizado(por_id.at[identificador, coluna]))
@@ -687,10 +689,15 @@ function(params) {
   const fimDeSemana = """
     + json.dumps(COLUNAS_FIM_DE_SEMANA)
     + """;
+  const listaSegura = (raw) => {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') { try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; } catch (_) { return []; } }
+    return [];
+  };
   const type = params.data._tipo;
   const value = String(params.value || '').toUpperCase();
-  const locked = (params.data._travas || []).includes(field);
-  const issue = (params.data._problemas || []).includes(field);
+  const locked = listaSegura(params.data._travas).includes(field);
+  const issue = listaSegura(params.data._problemas).includes(field);
   let style = {textAlign: 'center', fontWeight: '600', paddingLeft: '2px', paddingRight: '2px'};
   if (type === 'divisor') return {backgroundColor: '#0f172a', color: '#f8fafc', fontWeight: '800'};
   if (type === 'cobertura') {
@@ -716,7 +723,9 @@ function(params) {
 EDITAVEL_SE_NAO_TRAVADO = JsCode(
     """
 function(params) {
-  return params.data._tipo === 'profissional' && !(params.data._travas || []).includes(params.colDef.field);
+  let travas = [];
+  try { travas = Array.isArray(params.data._travas) ? params.data._travas : JSON.parse(params.data._travas || '[]'); } catch (_) { travas = []; }
+  return params.data._tipo === 'profissional' && !travas.includes(params.colDef.field);
 }
 """
 )
@@ -726,7 +735,9 @@ RENDERIZAR_COM_CADEADO = JsCode(
 function(params) {
   const element = document.createElement('span');
   element.textContent = params.value || '';
-  if ((params.data._travas || []).includes(params.colDef.field)) {
+  let travas = [];
+  try { travas = Array.isArray(params.data._travas) ? params.data._travas : JSON.parse(params.data._travas || '[]'); } catch (_) { travas = []; }
+  if (travas.includes(params.colDef.field)) {
     const lock = document.createElement('span');
     lock.textContent = ' 🔒';
     lock.title = 'Protegido contra a otimização. Destrave no painel acima para editar.';
