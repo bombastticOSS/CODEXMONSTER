@@ -1144,17 +1144,22 @@ with c3:
 with c4:
 	st.caption("A otimização respeita todas as células com 🔒. Para alterar uma delas, destrave-a explicitamente antes de editar.")
 
-with st.expander("Ferramentas de gestão da escala", expanded=False):
 with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0):
-	aba_travas, aba_lote, aba_pedidos, aba_exportar = st.tabs(["🔒 Travas", "📌 Lançamento em lote", "🌿 Pedidos de folga", "⬇️ Exportar"])
+	aba_travas, aba_lote, aba_pedidos, aba_exportar = st.tabs(
+		["🔒 Travas", "📌 Lançamento em lote", "🌿 Pedidos de folga", "⬇️ Exportar"]
+	)
 	with aba_travas:
-		opcoes_pessoas = {f"{linha['Nome']} ({linha['Código/Cargo']})": linha["ID"] for _, linha in PROFISSIONAIS.iterrows()}
+		opcoes_pessoas = {
+			f"{linha['Nome']} ({linha['Código/Cargo']})": linha["ID"]
+			for _, linha in PROFISSIONAIS.iterrows()
+		}
 		esquerda, centro, direita = st.columns([2, 4, 2])
 		esquerda, centro, direita = st.columns([2, 4, 4])
 		pessoa_nome = esquerda.selectbox("Colaborador", list(opcoes_pessoas), key="trava_pessoa")
 		identificador_trava = opcoes_pessoas[pessoa_nome]
 		travas_da_pessoa = sorted(st.session_state.travas.get(identificador_trava, set()))
 		esquerda.caption(f"{len(travas_da_pessoa)} dia(s) protegido(s)")
+		
 		dias_trava = centro.multiselect(
 			"Dias a gerir",
 			"Dias protegidos / a gerir",
@@ -1179,11 +1184,13 @@ with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0)
 			aplicar_travas(identificador_trava, dias_trava, "travar")
 			st.success("Travas aplicadas.")
 			st.rerun()
+			
 		if botao_destravar and dias_trava:
 			aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "destravar")
 			aplicar_travas(identificador_trava, dias_trava, "destravar")
 			st.success("Travas removidas.")
 			st.rerun()
+			
 		if botao_destravar_todos:
 			aplicar_travas(identificador_trava, travas_da_pessoa, "destravar")
 			st.success("Todas as travas deste colaborador foram removidas.")
