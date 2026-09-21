@@ -715,16 +715,15 @@ def executar_otimizacao() -> tuple[bool, str]:
                     break
             nova.at[identificador, coluna] = novo_valor
 
-    st.session_state.escala = nova.reset_index()
-    st.session_state.ultima_otimizacao = "Concluída agora"
-    st.session_state.revisao_grade = st.session_state.get("revisao_grade", 0) + 1
-    salvar_estado()
-    qualidade = "ótima" if status == cp_model.OPTIMAL else "viável"
-    return True, (
-        f"Nova alternativa {qualidade} gerada. Todas as "
-    return True, f"Escala {qualidade} gerada. Todas as {sum(map(len, st.session_state.travas.values()))} travas foram preservadas."
-        f"{sum(map(len, st.session_state.travas.values()))} travas foram preservadas."
-    )
+st.session\_state.escala = nova.reset\_index()
+st.session\_state.ultima\_otimizacao = "Concluída agora"
+st.session\_state.revisao\_grade = st.session\_state.get("revisao\_grade", 0) + 1
+salvar\_estado()
+qualidade = "ótima" if status == cp\_model.OPTIMAL else "viável"
+return True, (
+	f"Nova alternativa {qualidade} gerada. Todas as "
+	f"{sum(map(len, st.session\_state.travas.values()))} travas foram preservadas."
+)
 
 
 # -----------------------------------------------------------------------------
