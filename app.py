@@ -1162,12 +1162,12 @@ with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0)
 		
 		dias_trava = centro.multiselect(
 			"Dias a gerir",
-			"Dias protegidos / a gerir",
 			COLUNAS_DIAS,
-			format_func=lambda chave: ROTULOS_DIAS[chave].replace("\n", " "),
 			default=travas_da_pessoa,
+			format_func=lambda chave: ROTULOS_DIAS[chave].replace("\n", " "),
 			key=f"trava_dias_{identificador_trava}",
 		)
+		
 		with direita:
 			st.write("")
 			botao_travar = st.button("🔒 Travar", use_container_width=True, key="botao_travar")
