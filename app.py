@@ -1130,7 +1130,6 @@ travas_ativas = sum(len(dias) for dias in st.session_state.travas.values())
 c1, c2, c3, c4 = st.columns([1.15, 1.15, 1.2, 2.5])
 with c1:
 	if st.button("✨ Otimizar escala", type="primary", use_container_width=True):
-	if st.button("✨ Gerar nova alternativa", type="primary", width="stretch"):
 		with st.spinner("Calculando a melhor escala sem modificar células protegidas..."):
 			sucesso, mensagem = executar_otimizacao()
 		if sucesso:
