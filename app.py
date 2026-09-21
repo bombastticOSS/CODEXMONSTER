@@ -1044,17 +1044,18 @@ def dashboard() -> None:
 		)
 
 	criticos = resumo[(resumo["Déficit"] > 0) | (resumo["Ocupação %"] >= 90)].copy()
+	
 	if not criticos.empty:
 		atencao_coluna, espaco_coluna = st.columns([1.7, 1], vertical_alignment="top")
 		with atencao_coluna:
-		st.markdown("##### Dias que exigem atenção")
-		st.dataframe(
-			criticos[
-				["Dia", "Pacientes Ala A", "Pacientes Ala B", "Ocupação %", "Pessoas escaladas", "Déficit", "Cobertura %"]
-			],
-			use_container_width=True,
-			hide_index=True,
-		)
+			st.markdown("##### Dias que exigem atenção")
+			st.dataframe(
+				criticos[
+					["Dia", "Pacientes Ala A", "Pacientes Ala B", "Ocupação %", "Pessoas escaladas", "Déficit", "Cobertura %"]
+				],
+				use_container_width=True,
+				hide_index=True,
+			)
 			st.markdown("##### Dias que exigem atenção")
 			st.dataframe(
 				criticos[
