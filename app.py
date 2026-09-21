@@ -733,17 +733,16 @@ function(params) {
 RENDERIZAR_COM_CADEADO = JsCode(
     """
 function(params) {
-  const element = document.createElement('span');
-  element.textContent = params.value || '';
   let travas = [];
-  try { travas = Array.isArray(params.data._travas) ? params.data._travas : JSON.parse(params.data._travas || '[]'); } catch (_) { travas = []; }
-  if (travas.includes(params.colDef.field)) {
-    const lock = document.createElement('span');
-    lock.textContent = ' 🔒';
-    lock.title = 'Protegido contra a otimização. Destrave no painel acima para editar.';
-    element.appendChild(lock);
+  try {
+    travas = Array.isArray(params.data._travas)
+      ? params.data._travas
+      : JSON.parse(params.data._travas || '[]');
+  } catch (_) {
+    travas = [];
   }
-  return element;
+  const valor = params.value == null ? '' : String(params.value);
+  return travas.includes(params.colDef.field) ? valor + ' 🔒' : valor;
 }
 """
 )
