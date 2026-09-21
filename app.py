@@ -948,16 +948,16 @@ def dashboard() -> None:
     censo_para_editar = censo[["Dia", "Ala A", "Ala B", "Total", "Ocupação %"]]
     censo_coluna, capacidade_coluna = st.columns([1.45, 1], vertical_alignment="top")
     with censo_coluna:
-    censo_editado = st.data_editor(
-        censo_para_editar,
-        hide_index=True,
-        use_container_width=True,
-        num_rows="fixed",
-        disabled=["Dia", "Total", "Ocupação %"],
-        column_config={
-            "Ala A": st.column_config.NumberColumn("Ala A", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
-            "Ala B": st.column_config.NumberColumn("Ala B", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
-            "Ocupação %": st.column_config.NumberColumn("Ocupação %", format="%.1f%%"),
+    	censo_editado = st.data_editor(
+        	censo_para_editar,
+        	hide_index=True,
+        	use_container_width=True,
+        	num_rows="fixed",
+        	disabled=["Dia", "Total", "Ocupação %"],
+        	column_config={
+            	"Ala A": st.column_config.NumberColumn("Ala A", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
+            	"Ala B": st.column_config.NumberColumn("Ala B", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
+            	"Ocupação %": st.column_config.NumberColumn("Ocupação %", format="%.1f%%"),
         },
         key="censo_alas",
     )
