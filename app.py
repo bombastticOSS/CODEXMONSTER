@@ -16,6 +16,7 @@ import calendar
 import io
 import json
 import os
+import random
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -441,6 +442,24 @@ def montar_grade_exibicao(escala: pd.DataFrame) -> pd.DataFrame:
             divisor.update({coluna: "" for coluna in COLUNAS_DIAS})
             linhas.append(divisor)
 
+            # Repetir as datas elimina a necessidade de subir até o topo para
+            # conferir o dia ao lançar a escala dos técnicos.
+            cabecalho_tecnicos = {
+                "_tipo": "cabecalho_tecnicos",
+                "_id": "__DATAS_TECNICOS__",
+                "Código/Cargo": "DATAS",
+                "Nome": "Técnicos de enfermagem",
+                "Meta": "",
+                "Realizado": "",
+                "Saldo": "",
+                "_travas": "[]",
+                "_problemas": "[]",
+            }
+            cabecalho_tecnicos.update(
+                {coluna: ROTULOS_DIAS[coluna].replace("\n", " ") for coluna in COLUNAS_DIAS}
+            )
+            linhas.append(cabecalho_tecnicos)
+
         for _, profissional in PROFISSIONAIS[PROFISSIONAIS["Cargo curto"] == cargo].iterrows():
             identificador = profissional["ID"]
             linha = {
@@ -530,6 +549,8 @@ def aplicar_travas(identificador: str, dias: list[str], acao: str) -> None:
         travas.update(dias)
     else:
         travas.difference_update(dias)
+    # Força a atualização das regras de edição da grade após destravar.
+    st.session_state.revisao_grade = st.session_state.get("revisao_grade", 0) + 1
     salvar_estado()
 
 
@@ -628,7 +649,12 @@ def executar_otimizacao() -> tuple[bool, str]:
             for turno in TURNOS:
                 modelo.Add(sum(variaveis[ident, indice, turno] for ident in ids_cargo) == requisito[cargo][turno])
 
+    # A cada execução, desempates recebem um peso novo. As travas permanecem
+    # absolutas; somente as células livres podem gerar uma alternativa distinta.
+    semente = random.SystemRandom().randint(1, 2_147_483_647)
+    sorteio = random.Random(semente)
     penalidades = []
+    desvios_absolutos = []
     for identificador in profissionais:
         meta = int(POR_ID[identificador]["Meta"])
         horas = sum(
@@ -641,16 +667,33 @@ def executar_otimizacao() -> tuple[bool, str]:
         absoluto = modelo.NewIntVar(0, 96, f"absoluto_{identificador}")
         modelo.Add(diferenca == horas - meta)
         modelo.AddAbsEquality(absoluto, diferenca)
+        desvios_absolutos.append(absoluto)
+        # Primeiro equilibra o maior desvio individual; depois a soma dos saldos.
+        # Isso evita concentrar dívidas grandes em poucas pessoas.
         penalidades.append(absoluto * 10)
+        penalidades.append(absoluto * 1_000)
         for coluna in st.session_state.pedidos_folga.get(identificador, set()):
             if coluna in COLUNAS_DIAS:
                 indice = COLUNAS_DIAS.index(coluna)
                 penalidades.append(sum(variaveis[identificador, indice, turno] for turno in TURNOS) * 500)
+                penalidades.append(sum(variaveis[identificador, indice, turno] for turno in TURNOS) * 100_000)
+
+    maior_desvio = modelo.NewIntVar(0, 96, "maior_desvio_individual")
+    for desvio in desvios_absolutos:
+        modelo.Add(maior_desvio >= desvio)
+    penalidades.append(maior_desvio * 100_000)
+
+    # Desempate de baixa prioridade: reorganiza os grupos sem sacrificar
+    # cobertura, pedidos de folga ou equilíbrio de horas.
+    for variavel in variaveis.values():
+        penalidades.append(variavel * sorteio.randint(0, 9))
 
     modelo.Minimize(sum(penalidades))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30.0
     solver.parameters.num_search_workers = 8
+    solver.parameters.random_seed = semente
+    solver.parameters.randomize_search = True
     status = solver.Solve(modelo)
 
     if status not in {cp_model.OPTIMAL, cp_model.FEASIBLE}:
@@ -674,9 +717,14 @@ def executar_otimizacao() -> tuple[bool, str]:
 
     st.session_state.escala = nova.reset_index()
     st.session_state.ultima_otimizacao = "Concluída agora"
+    st.session_state.revisao_grade = st.session_state.get("revisao_grade", 0) + 1
     salvar_estado()
     qualidade = "ótima" if status == cp_model.OPTIMAL else "viável"
+    return True, (
+        f"Nova alternativa {qualidade} gerada. Todas as "
     return True, f"Escala {qualidade} gerada. Todas as {sum(map(len, st.session_state.travas.values()))} travas foram preservadas."
+        f"{sum(map(len, st.session_state.travas.values()))} travas foram preservadas."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -700,6 +748,7 @@ function(params) {
   const issue = listaSegura(params.data._problemas).includes(field);
   let style = {textAlign: 'center', fontWeight: '600', paddingLeft: '2px', paddingRight: '2px'};
   if (type === 'divisor') return {backgroundColor: '#0f172a', color: '#f8fafc', fontWeight: '800'};
+  if (type === 'cabecalho_tecnicos') return {backgroundColor: '#dbe4ee', color: '#0f172a', fontWeight: '800', textAlign: 'center'};
   if (type === 'cobertura') {
     if (value === 'OK') return {...style, backgroundColor: '#d1fae5', color: '#065f46'};
     if (value.startsWith('–')) return {...style, backgroundColor: '#fee2e2', color: '#991b1b', border: '2px solid #ef4444'};
@@ -710,9 +759,12 @@ function(params) {
     'FP': ['#dcfce7', '#166534'], 'FE': ['#fef3c7', '#92400e'], 'AT': ['#fee2e2', '#991b1b'],
     'LM': ['#f3e8ff', '#6b21a8'], 'LIC': ['#ffedd5', '#9a3412']
   };
+  // Fim de semana usa cinza-azulado e borda grafite; M6 continua azul.
   if (fimDeSemana.includes(field)) style.borderTop = '2px solid #93c5fd';
+  if (fimDeSemana.includes(field)) style.borderTop = '3px solid #64748b';
   if (colors[value]) { style.backgroundColor = colors[value][0]; style.color = colors[value][1]; }
   if (!value && field.startsWith('D')) style.backgroundColor = fimDeSemana.includes(field) ? '#eff6ff' : '#ffffff';
+  if (!value && field.startsWith('D')) style.backgroundColor = fimDeSemana.includes(field) ? '#f1f5f9' : '#ffffff';
   if (issue) { style.backgroundColor = '#fecaca'; style.color = '#991b1b'; style.border = '2px solid #dc2626'; }
   if (locked) { style.boxShadow = 'inset 0 0 0 2px #3730a3'; }
   return style;
@@ -733,15 +785,20 @@ function(params) {
 RENDERIZAR_COM_CADEADO = JsCode(
     """
 function(params) {
+  const element = document.createElement('span');
+  element.textContent = params.value || '';
   let travas = [];
-  try {
-    travas = Array.isArray(params.data._travas)
-      ? params.data._travas
-      : JSON.parse(params.data._travas || '[]');
-  } catch (_) {
-    travas = [];
+  try { travas = Array.isArray(params.data._travas) ? params.data._travas : JSON.parse(params.data._travas || '[]'); } catch (_) { travas = []; }
+  if (travas.includes(params.colDef.field)) {
+    const lock = document.createElement('span');
+    lock.textContent = ' 🔒';
+    lock.title = 'Protegido contra a otimização. Destrave no painel acima para editar.';
+    element.appendChild(lock);
   }
+  return element;
   const valor = params.value == null ? '' : String(params.value);
+  // O componente Streamlit-AgGrid é renderizado por React e aceita texto,
+  // não um HTMLElement criado manualmente.
   return travas.includes(params.colDef.field) ? valor + ' 🔒' : valor;
 }
 """
@@ -763,6 +820,21 @@ def exibir_grade_mensal() -> None:
         "</div>",
         unsafe_allow_html=True,
     )
+    instrucao, legenda = st.columns([3.7, 2.3], vertical_alignment="center")
+    with instrucao:
+        st.caption(
+            "Edite células livres pelo menu. A alteração manual recebe 🔒 automaticamente; "
+            "FP é preferência e não bloqueia a otimização. Use o painel de travas para liberar uma célula."
+        )
+    with legenda:
+        st.markdown(
+            "<div class='legenda'>"
+            "<span class='m6'>M6</span><span class='d12'>D12</span><span class='n12'>N12</span><span class='fp'>FP</span>"
+            "<span class='fe'>FE</span><span class='at'>AT</span><span class='lm'>LM</span><span class='lic'>LIC</span>"
+            "<span class='lock'>🔒</span><span class='error'>conflito</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     if not AGGRID_DISPONIVEL:
         st.warning("Para a grade colorida e os cadeados por célula, instale as dependências indicadas no arquivo requirements.")
@@ -775,6 +847,7 @@ def exibir_grade_mensal() -> None:
             simples,
             hide_index=True,
             use_container_width=True,
+            width="stretch",
             disabled=["_tipo", "_id", "Código/Cargo", "Nome", "Meta", "Realizado", "Saldo", "_travas", "_problemas"],
             column_config=opcoes_coluna,
             key="grade_basica",
@@ -818,6 +891,8 @@ def exibir_grade_mensal() -> None:
     # Em monitores hospitalares usuais, mantém os 30 dias visíveis; em telas muito estreitas,
     # o navegador reduzirá as colunas até o mínimo, sem criar uma segunda visão semanal.
     altura = min(max(560, len(grade) * 34 + 65), 1600)
+    # Cabeçalhos ficam visíveis enquanto a equipe técnica é percorrida.
+    altura = min(max(610, len(grade) * 34 + 65), 940)
     resposta = AgGrid(
         grade,
         gridOptions=opcoes,
@@ -826,6 +901,7 @@ def exibir_grade_mensal() -> None:
         update_mode=GridUpdateMode.VALUE_CHANGED,
         data_return_mode=DataReturnMode.AS_INPUT,
         fit_columns_on_grid_load=True,
+        reload_data=True,
         allow_unsafe_jscode=True,
         key="grade_mensal_hc15",
     )
@@ -871,6 +947,8 @@ def dashboard() -> None:
     st.subheader("Censo manual e capacidade das alas")
     st.caption("Registre o censo de cada dia. Ala A + Ala B não pode ultrapassar 60 leitos; o censo não altera a escala automaticamente.")
     censo_para_editar = censo[["Dia", "Ala A", "Ala B", "Total", "Ocupação %"]]
+    censo_coluna, capacidade_coluna = st.columns([1.45, 1], vertical_alignment="top")
+    with censo_coluna:
     censo_editado = st.data_editor(
         censo_para_editar,
         hide_index=True,
@@ -884,6 +962,25 @@ def dashboard() -> None:
         },
         key="censo_alas",
     )
+        censo_editado = st.data_editor(
+            censo_para_editar,
+            hide_index=True,
+            width="stretch",
+            num_rows="fixed",
+            disabled=["Dia", "Total", "Ocupação %"],
+            column_config={
+                "Ala A": st.column_config.NumberColumn("Ala A", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
+                "Ala B": st.column_config.NumberColumn("Ala B", min_value=0, max_value=LEITOS_TOTAIS, step=1, format="%d"),
+                "Ocupação %": st.column_config.NumberColumn("Ocupação %", format="%.1f%%"),
+            },
+            key="censo_alas",
+        )
+    with capacidade_coluna:
+        st.markdown("##### Capacidade do 15º andar")
+        k_a, k_b = st.columns(2)
+        k_a.metric("Leitos", LEITOS_TOTAIS)
+        k_b.metric("Maior ocupação", f"{float(censo['Ocupação %'].max()):.1f}%")
+        st.info("O censo é uma informação de dimensionamento: ele contextualiza a escala, mas não cria plantões automaticamente.")
     valido, avisos = atualizar_censo(censo_editado)
     if not valido:
         for aviso in avisos:
@@ -901,9 +998,11 @@ def dashboard() -> None:
 
     st.subheader("Leitura executiva da competência")
     k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1, k2, k3 = st.columns(3)
     k1.metric("Cobertura média", f"{media_cobertura:.1f}%")
     k2.metric("Dias críticos", f"{dias_criticos}", "com déficit" if dias_criticos else "sem déficit")
     k3.metric("Horas programadas", f"{total_horas}h", f"meta total: {total_metas}h")
+    k4, k5, k6 = st.columns(3)
     k4.metric("Ocupação máxima", f"{maior_ocupacao:.1f}%")
     k5.metric("Média de pacientes/dia", f"{media_pacientes:.1f}")
     k6.metric("Alertas de regra", len(mensagens))
@@ -913,9 +1012,11 @@ def dashboard() -> None:
     with esquerda:
         st.markdown("##### Pessoas escaladas × plantões previstos")
         st.bar_chart(grafico[["Pessoas escaladas", "Plantões previstos"]], use_container_width=True)
+        st.bar_chart(grafico[["Pessoas escaladas", "Plantões previstos"]], width="stretch")
     with direita:
         st.markdown("##### Cobertura e ocupação")
         st.line_chart(grafico[["Cobertura %", "Ocupação %"]], use_container_width=True)
+        st.line_chart(grafico[["Cobertura %", "Ocupação %"]], width="stretch")
 
     comparativo = (
         resumo.groupby("Tipo de dia", as_index=False)
@@ -931,11 +1032,20 @@ def dashboard() -> None:
         )
         .round(2)
     )
+    comparacao_coluna, criterio_coluna = st.columns([1.6, 1], vertical_alignment="top")
+    with comparacao_coluna:
     st.markdown("##### Comparativo: dias úteis × fins de semana")
     st.dataframe(comparativo, use_container_width=True, hide_index=True)
+        st.markdown("##### Comparativo: dias úteis × fins de semana")
+        st.dataframe(comparativo, width="stretch", hide_index=True)
+    with criterio_coluna:
+        st.markdown("##### Leitura rápida")
+        st.caption("Cobertura mede plantões realizados contra o mínimo configurado. Pacientes por profissional é um indicador de carga, não substitui parâmetro assistencial oficial.")
 
     criticos = resumo[(resumo["Déficit"] > 0) | (resumo["Ocupação %"] >= 90)].copy()
     if not criticos.empty:
+        atencao_coluna, espaco_coluna = st.columns([1.7, 1], vertical_alignment="top")
+        with atencao_coluna:
         st.markdown("##### Dias que exigem atenção")
         st.dataframe(
             criticos[
@@ -944,6 +1054,16 @@ def dashboard() -> None:
             use_container_width=True,
             hide_index=True,
         )
+            st.markdown("##### Dias que exigem atenção")
+            st.dataframe(
+                criticos[
+                    ["Dia", "Pacientes Ala A", "Pacientes Ala B", "Ocupação %", "Pessoas escaladas", "Déficit", "Cobertura %"]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        with espaco_coluna:
+            st.warning("Priorize dias com déficit. Acima de 90% de ocupação, reavalie a distribuição entre as alas.")
     else:
         st.success("Não há déficit de cobertura nem ocupação acima de 90% nos dados atuais.")
 
@@ -951,6 +1071,7 @@ def dashboard() -> None:
         st.dataframe(
             resumo.drop(columns=["Chave"]),
             use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=520,
         )
@@ -977,12 +1098,15 @@ st.markdown(
     """
 <style>
   .block-container {max-width: 100%; padding: 1.1rem 1rem 2.4rem;}
+  .block-container {max-width: 1600px; padding: 1.45rem 2.5rem 2.8rem; margin: 0 auto;}
   h1 {font-size: 1.7rem !important; margin-bottom: .1rem !important;}
   [data-testid="stMetric"] {background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: .65rem;}
   [data-testid="stMetricLabel"] {font-size: .78rem !important;}
   [data-testid="stMetricValue"] {font-size: 1.35rem !important;}
   .legenda {display:flex; flex-wrap:wrap; gap:.4rem; margin:.45rem 0 .8rem;}
   .legenda span {border-radius:999px; padding:.2rem .55rem; font-size:.72rem; font-weight:650;}
+  .legenda {display:flex; flex-wrap:wrap; justify-content:flex-end; gap:.25rem; margin:.1rem 0 .35rem;}
+  .legenda span {border-radius:999px; padding:.15rem .38rem; font-size:.64rem; font-weight:700;}
   .m6 {background:#dbeafe;color:#1e3a8a}.d12 {background:#cffafe;color:#155e75}.n12 {background:#e0e7ff;color:#3730a3}
   .fp {background:#dcfce7;color:#166534}.fe {background:#fef3c7;color:#92400e}.at {background:#fee2e2;color:#991b1b}
   .lm {background:#f3e8ff;color:#6b21a8}.lic {background:#ffedd5;color:#9a3412}.lock {background:#eef2ff;color:#3730a3}.error {background:#fecaca;color:#991b1b}
@@ -1004,6 +1128,7 @@ travas_ativas = sum(len(dias) for dias in st.session_state.travas.values())
 c1, c2, c3, c4 = st.columns([1.15, 1.15, 1.2, 2.5])
 with c1:
     if st.button("✨ Otimizar escala", type="primary", use_container_width=True):
+    if st.button("✨ Gerar nova alternativa", type="primary", width="stretch"):
         with st.spinner("Calculando a melhor escala sem modificar células protegidas..."):
             sucesso, mensagem = executar_otimizacao()
         if sucesso:
@@ -1019,28 +1144,48 @@ with c4:
     st.caption("A otimização respeita todas as células com 🔒. Para alterar uma delas, destrave-a explicitamente antes de editar.")
 
 with st.expander("Ferramentas de gestão da escala", expanded=False):
+with st.expander("Ferramentas de gestão da escala", expanded=travas_ativas > 0):
     aba_travas, aba_lote, aba_pedidos, aba_exportar = st.tabs(["🔒 Travas", "📌 Lançamento em lote", "🌿 Pedidos de folga", "⬇️ Exportar"])
     with aba_travas:
         opcoes_pessoas = {f"{linha['Nome']} ({linha['Código/Cargo']})": linha["ID"] for _, linha in PROFISSIONAIS.iterrows()}
         esquerda, centro, direita = st.columns([2, 4, 2])
+        esquerda, centro, direita = st.columns([2, 4, 4])
         pessoa_nome = esquerda.selectbox("Colaborador", list(opcoes_pessoas), key="trava_pessoa")
+        identificador_trava = opcoes_pessoas[pessoa_nome]
+        travas_da_pessoa = sorted(st.session_state.travas.get(identificador_trava, set()))
+        esquerda.caption(f"{len(travas_da_pessoa)} dia(s) protegido(s)")
         dias_trava = centro.multiselect(
             "Dias a gerir",
+            "Dias protegidos / a gerir",
             COLUNAS_DIAS,
             format_func=lambda chave: ROTULOS_DIAS[chave].replace("\n", " "),
             key="trava_dias",
+            default=travas_da_pessoa,
+            key=f"trava_dias_{identificador_trava}",
         )
         with direita:
             st.write("")
             botao_travar = st.button("🔒 Travar", use_container_width=True, key="botao_travar")
             botao_destravar = st.button("🔓 Destravar", use_container_width=True, key="botao_destravar")
+            b_travar, b_destravar, b_todos = st.columns(3)
+            botao_travar = b_travar.button("🔒 Travar", width="stretch", key="botao_travar")
+            botao_destravar = b_destravar.button("🔓 Seleção", width="stretch", key="botao_destravar")
+            botao_destravar_todos = b_todos.button(
+                "Liberar tudo", width="stretch", key="botao_destravar_todos", disabled=not travas_da_pessoa
+            )
         if botao_travar and dias_trava:
             aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "travar")
+            aplicar_travas(identificador_trava, dias_trava, "travar")
             st.success("Travas aplicadas.")
             st.rerun()
         if botao_destravar and dias_trava:
             aplicar_travas(opcoes_pessoas[pessoa_nome], dias_trava, "destravar")
+            aplicar_travas(identificador_trava, dias_trava, "destravar")
             st.success("Travas removidas.")
+            st.rerun()
+        if botao_destravar_todos:
+            aplicar_travas(identificador_trava, travas_da_pessoa, "destravar")
+            st.success("Todas as travas deste colaborador foram removidas.")
             st.rerun()
     with aba_lote:
         l1, l2, l3 = st.columns([3, 3, 2])
@@ -1074,6 +1219,7 @@ with st.expander("Ferramentas de gestão da escala", expanded=False):
             file_name=f"escala_hc15_{ANO}_{MES:02d}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            width="stretch",
         )
 
 aba_escala, aba_dashboard = st.tabs(["📋 Escala mensal", "📊 Dashboard de dimensionamento"])
