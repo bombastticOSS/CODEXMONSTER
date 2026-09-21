@@ -820,17 +820,14 @@ with st.expander("Ferramentas de gestão da escala", expanded=False):
             qtd, _ = carregar_pedidos_arquivo(arq)
             st.success(f"{qtd} pedidos importados.")
             st.rerun()
-    aba_escala, aba_dashboard = st.tabs(["📋 Escala mensal", "📊 Dashboard de dimensionamento"])
+    with aba_exportar:
+        st.download_button("Baixar Excel consolidado", data=gerar_excel(), file_name=f"escala_{ANO}_{MES:02d}.xlsx", mime="application/vnd.ms-excel", use_container_width=True)
+
+aba_escala, aba_dashboard = st.tabs(["📋 Escala mensal", "📊 Dashboard de dimensionamento"])
 with aba_escala:
     exibir_grade_mensal()
-    # CORREÇÃO: Usando a variável 'avisos_auditoria' que foi gerada no topo do código
-    if avisos_auditoria:
-        with st.expander(f"⚠️ {len(avisos_auditoria)} alerta(s) de consistência", expanded=True):
-            for m in avisos_auditoria[:20]: 
-                st.write(f"• {m}")
-            if len(avisos_auditoria) > 20:
-                st.caption(f"Mostrando 20 de {len(avisos_auditoria)} alertas.")
-    else:
-        st.success("A escala atende às regras e à cobertura configuradas neste protótipo.")
+    if mensagens:
+        with st.expander(f"⚠️ {len(mensagens)} alerta(s) de consistência", expanded=True):
+            for m in mensagens[:20]: st.write(f"• {m}")
 with aba_dashboard:
     dashboard()
